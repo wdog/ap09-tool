@@ -172,13 +172,11 @@ away only when the pedal compacts its index (see Upload status).
  #    length  blocks  state
  0    13.93s      15  ● saved
  1     7.94s       9  ⚠ damaged 3/9
- 2    19.91s      22  ↺ duplicate of #3
  3    19.91s      22  ▶ playing
 
 ▶ playing   loop the pedal plays now
 ● saved     old loop, not playing, audio still in memory -> select N / download -r N
 ⚠ damaged   old loop, N/M blocks overwritten by a later one
-↺ duplicate same audio as another entry
   history stays until the pedal compacts its index (seen when the log was half full)
 ```
 
@@ -191,7 +189,6 @@ Colours are used on a terminal; set `NO_COLOR=1` to turn them off.
 | ▶ | playing | the loop the pedal plays |
 | ● | saved | older loop, audio still in memory: `download -r N` / `select N` |
 | ⚠ | damaged | older loop, N/M blocks overwritten by a later loop |
-| ↺ | duplicate | same audio as another entry |
 | ■ | no loop | pedal empty or cleared |
 
 
@@ -220,7 +217,9 @@ sudo python3 ap09.py select 8        # loop #8 becomes the current one again
 ```
 
 Unplug and replug afterwards. `select` does not copy any audio: it only adds an index
-record that points at the old loop's memory blocks. That only works while those blocks
+record that points at the old loop's memory blocks. The index is append-only, so every
+`select` adds a record, but `list` merges records that point at the same audio: each loop
+appears only once. `select` on the loop that is already playing writes nothing. That only works while those blocks
 have not been reused (`list` tells you).
 
 ### Running without sudo

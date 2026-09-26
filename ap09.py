@@ -299,16 +299,31 @@ def scan_index(lp: Looper):
 
 
 def all_records(lp: Looper):
-    """Every valid record, oldest first. 'current' is True on the loop the pedal plays."""
+    """Distinct loops in the index, oldest first, one entry per audio.
+
+    The index is an append-only log, so 'select' adds a second record pointing at the same
+    audio. Records with the same length and blocks are merged here: each loop appears once,
+    with 'records' = how many index records point at it. 'current' marks the loop the pedal
+    plays (the newest record, unless that record clears the loop).
+    """
     raw, _ = read_index(lp)
-    recs = [r for r in raw if r["valid"]]
+    newest = raw[-1] if raw and raw[-1]["valid"] else None
+    newest_key = (newest["length"], tuple(newest["blocks"])) if newest else None
+    loops = {}
+    for pos, r in enumerate(raw):
+        if not r["valid"]:
+            continue
+        key = (r["length"], tuple(r["blocks"]))
+        if key not in loops:
+            loops[key] = dict(r, first=pos, records=0)
+        loops[key]["records"] += 1
+    recs = sorted(loops.values(), key=lambda r: r["first"])
     for r in recs:
-        r["current"] = r is raw[-1]
-    # A later record for a different loop that reuses a block overwrote that block's audio.
-    for i, r in enumerate(recs):
-        r["same_as"] = next((j for j in range(i + 1, len(recs))
-                             if recs[j]["blocks"] == r["blocks"] and recs[j]["length"] == r["length"]), None)
-        later = set(b for x in recs[i + 1:] if x["blocks"] != r["blocks"] for b in x["blocks"])
+        r["current"] = (r["length"], tuple(r["blocks"])) == newest_key
+        r["same_as"] = None  # duplicates are merged, kept for callers that check it
+        # Audio is written once, when the loop first appears; a different loop that shows
+        # up later and uses one of its blocks has overwritten that part.
+        later = set(b for x in recs if x["first"] > r["first"] for b in x["blocks"])
         r["overwritten"] = len(set(r["blocks"]) & later)
     return recs
 
@@ -635,6 +650,9 @@ def cmd_select(lp, args):
     if not 0 <= args.record < len(recs):
         raise DeviceError(f"no record #{args.record} (see 'list')")
     r = recs[args.record]
+    if r["current"]:
+        print(f"loop #{args.record} is already the one the pedal plays; nothing written", file=sys.stderr)
+        return
     if r["overwritten"]:
         print(f"warning: {r['overwritten']} blocks of loop #{args.record} were reused later; "
               "it will play partly corrupted", file=sys.stderr)

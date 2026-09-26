@@ -817,6 +817,9 @@ class LooperWindow(Adw.ApplicationWindow):
     # ---------------------------------------------------------- select / clear / space
 
     def confirm_select(self, i, r):
+        if r["current"]:
+            self.toast(f"Loop #{i} is already on the pedal")
+            return
         warn = ""
         if r["overwritten"]:
             warn = f"\n\n⚠ {r['overwritten']} of its {len(r['blocks'])} blocks were reused: it will sound damaged."
