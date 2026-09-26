@@ -23,7 +23,7 @@ CMD_INFO = 0x11
 CMD_ERASE = 0x21
 CMD_WRITE = 0x22
 CMD_READ = 0x23
-CMD_24 = 0x24  # purpose unknown (9-byte body: area, addr LE32, LE32)
+CMD_24 = 0x24  # checksum: body area, addr LE32, len LE32 -> echo + u16 sum of the bytes
 
 AREA_MCU = 0   # MCU internal flash (firmware + settings) - never write here
 AREA_NAND = 1  # 256 MiB NAND holding the audio and the loop index
@@ -109,20 +109,56 @@ class Looper:
         dev = usb.core.find(idVendor=VID, idProduct=PID)
         if dev is None:
             raise DeviceError(f"looper {VID:04x}:{PID:04x} not found (plugged in?)")
+        self.dev = dev
+        self.detached = []
         for cfg in dev:
             for intf in cfg:
                 if dev.is_kernel_driver_active(intf.bInterfaceNumber):
                     dev.detach_kernel_driver(intf.bInterfaceNumber)
+                    self.detached.append(intf.bInterfaceNumber)
+        # Always (re)select the configuration: it resets the endpoints' state, which
+        # the firmware needs after a previous session (skipping it -> pipe errors).
         dev.set_configuration()
         usb.util.claim_interface(dev, INTERFACE)
-        self.dev = dev
+        self._sync()
+
+    def _drain(self):
+        """Throw away reply bytes left over from an interrupted previous run."""
+        for _ in range(10000):
+            try:
+                self.dev.read(EP_IN, 4096, timeout=50)
+            except usb.core.USBError:
+                return
+
+    def _sync(self):
+        """Make sure the pipe is clean: drain, then check that 'info' answers properly.
+        If not (stalled endpoint after an aborted transfer), USB-reset the pedal once.
+        clear_halt is avoided on purpose: this firmware wedges after it."""
+        for attempt in range(2):
+            self._drain()
+            try:
+                self.command(CMD_INFO, timeout=1000)
+                return
+            except DeviceError:
+                if attempt:
+                    raise
+            try:
+                usb.util.release_interface(self.dev, INTERFACE)
+                self.dev.reset()
+                usb.util.claim_interface(self.dev, INTERFACE)
+            except usb.core.USBError as e:
+                raise DeviceError(f"pedal not responding and USB reset failed ({e}); unplug/replug it")
 
     def close(self):
         try:
             usb.util.release_interface(self.dev, INTERFACE)
-            self.dev.attach_kernel_driver(INTERFACE)
         except usb.core.USBError:
             pass
+        for i in self.detached:  # give the MIDI port back to snd-usb-audio
+            try:
+                self.dev.attach_kernel_driver(i)
+            except usb.core.USBError:
+                pass
 
     def raw(self, sysex: bytes, timeout=3000) -> bytes:
         self.dev.write(EP_OUT, encode_usb_midi(sysex), timeout=timeout)
@@ -142,7 +178,7 @@ class Looper:
             raise DeviceError(f"bad reply header: {reply[:8].hex(' ')}")
         n = int.from_bytes(reply[3:6], "little")
         rbody = reply[6:6 + n]
-        if len(rbody) != n or reply[6 + n] != checksum(rbody):
+        if len(reply) < 7 + n or reply[6 + n] != checksum(rbody):
             raise DeviceError(f"reply checksum/length error for cmd 0x{cmd:02x}")
         return reply[2], rbody
 
@@ -158,6 +194,20 @@ class Looper:
         rcmd, rbody = self.transact(cmd, body, timeout)
         if rcmd != 0x00 or rbody != b"\x00":
             raise DeviceError(f"cmd 0x{cmd:02x} failed (reply cmd 0x{rcmd:02x}, status {rbody.hex(' ')})")
+
+    def checksum(self, area: int, addr: int, length: int) -> int:
+        """16-bit sum of `length` bytes computed on the device (cmd 0x24)."""
+        body = bytes([area]) + addr.to_bytes(4, "little") + length.to_bytes(4, "little")
+        r = self.command(CMD_24, body, timeout=30000)
+        if r[:9] != body:
+            raise DeviceError("checksum reply does not echo the request")
+        return int.from_bytes(r[9:11], "little")
+
+    def block_is_erased(self, blk: int) -> bool:
+        a = blk * BLOCK_SIZE
+        n = BLOCK_SIZE - 1  # odd length so an all-FF block (0xff01) can't be confused with all-00
+        return self.checksum(AREA_NAND, a, n) == (0xFF * n) & 0xFFFF and \
+            self.read(AREA_NAND, a, 16) == b"\xff" * 16
 
     def erase_block(self, area: int, addr: int):
         self.status_command(CMD_ERASE, bytes([area]) + addr.to_bytes(4, "little"), timeout=30000)
@@ -187,56 +237,73 @@ class Looper:
 
 # ---------------------------------------------------------------- loop index
 
-def parse_record(rec: bytes):
-    """Decode one 'looper' index record. Returns None if not a valid record."""
-    if rec[:7] != b"looper\x00" or rec[8] == 0:
-        return None
+RECORD_HEAD = 16  # bytes before the block list
+
+
+def record_length(rec: bytes) -> int:
     pages_hi = int.from_bytes(rec[12:14], "little")   # whole blocks
     pages_lo = rec[14]                                # extra whole pages
     tail = rec[15]                                    # 186-byte units in last page, minus 1
-    length = (pages_hi * PAGES_PER_BLOCK + pages_lo) * PAGE_AUDIO + (tail + 1) * TAIL_UNIT
+    return (pages_hi * PAGES_PER_BLOCK + pages_lo) * PAGE_AUDIO + (tail + 1) * TAIL_UNIT
+
+
+def parse_record(rec: bytes):
+    """Decode one 'looper' index record (needs the full block list). None if not valid."""
+    if rec[:7] != b"looper\x00" or rec[8] == 0:
+        return None
+    length = record_length(rec)
     nblocks = -(-length // (PAGE_AUDIO * PAGES_PER_BLOCK))
-    blocks = struct.unpack_from(f"<{nblocks}H", rec, 16)
+    if nblocks > MAX_BLOCKS:
+        return None
     return {
         "seq": int.from_bytes(rec[10:12], "little"),
         "length": length,
-        "blocks": list(blocks),
+        "blocks": list(struct.unpack_from(f"<{nblocks}H", rec, RECORD_HEAD)),
     }
 
 
-def scan_index(lp: Looper):
-    """Walk the record log in the index block.
+def read_index(lp: Looper):
+    """Walk the record log in the index block, oldest first.
 
-    Returns (current_loop_or_None, last_used_offset_or_None, blocks referenced by any record).
-    The newest record wins; a record with the valid flag cleared means "no loop".
+    Returns (records, last_offset): every 'looper' record found, each as a dict with
+    'offset' and 'valid' (plus 'length'/'blocks'/'seq' when valid), and the offset of
+    the newest record (None if the log is empty). The newest record is the current
+    state; if its valid flag is 0 the pedal has no loop.
     """
-    current, last_off, used = None, None, set()
+    recs, last_off = [], None
+    base = INDEX_BLOCK * BLOCK_SIZE
     for off in range(0, BLOCK_SIZE, RECORD_STRIDE):
-        rec = lp.read(AREA_NAND, INDEX_BLOCK * BLOCK_SIZE + off, 0x60)
-        if rec[:6] == b"\xff" * 6:
+        head = lp.read(AREA_NAND, base + off, 0x60)
+        if head[:6] == b"\xff" * 6:
             break  # rest of the log is unwritten
-        if rec[:7] != b"looper\x00":
+        if head[:7] != b"looper\x00":
             continue
         last_off = off
-        r = parse_record(rec)
-        if r:
-            r["offset"] = off
-            used.update(r["blocks"])
-        current = r
+        rec = head
+        if head[8]:
+            need = RECORD_HEAD + 2 * -(-record_length(head) // (PAGE_AUDIO * PAGES_PER_BLOCK))
+            if need > len(head):
+                rec = head + lp.read(AREA_NAND, base + off + len(head), min(need, RECORD_SIZE) - len(head))
+        r = parse_record(rec) or {}
+        r.update(offset=off, valid=bool(r))
+        recs.append(r)
+    return recs, last_off
+
+
+def scan_index(lp: Looper):
+    """Returns (current_loop_or_None, last_offset_or_None, blocks referenced by any record)."""
+    recs, last_off = read_index(lp)
+    used = set(b for r in recs if r["valid"] for b in r["blocks"])
+    current = recs[-1] if recs and recs[-1]["valid"] else None
     return current, last_off, used
 
 
 def all_records(lp: Looper):
-    """Every valid record in the index log, oldest first (the last one is the current loop)."""
-    recs = []
-    for off in range(0, BLOCK_SIZE, RECORD_STRIDE):
-        rec = lp.read(AREA_NAND, INDEX_BLOCK * BLOCK_SIZE + off, 0x60)
-        if rec[:6] == b"\xff" * 6:
-            break
-        r = parse_record(rec)
-        if r:
-            r["offset"] = off
-            recs.append(r)
+    """Every valid record, oldest first. 'current' is True on the loop the pedal plays."""
+    raw, _ = read_index(lp)
+    recs = [r for r in raw if r["valid"]]
+    for r in recs:
+        r["current"] = r is raw[-1]
     # A later record for a different loop that reuses a block overwrote that block's audio.
     for i, r in enumerate(recs):
         r["same_as"] = next((j for j in range(i + 1, len(recs))
@@ -289,6 +356,11 @@ def load_audio(path: str) -> bytes:
     A WAV already in the pedal's format is read directly; anything else
     (other WAV formats, mp3, flac, ...) is converted with ffmpeg.
     """
+    import os
+    if not os.path.isfile(path):
+        raise DeviceError(f"file not found: {path}")
+    if not os.access(path, os.R_OK):
+        raise DeviceError(f"cannot read file: {path}")
     try:
         with wave.open(path, "rb") as w:
             if (w.getnchannels(), w.getsampwidth(), w.getframerate()) == (1, SAMPLE_WIDTH, SAMPLE_RATE):
@@ -342,54 +414,95 @@ def upload_loop(lp: Looper, pcm: bytes, progress=True):
 
     _, last_off, used = scan_index(lp)
 
-    # Same strategy as the official tool (0x406ca0): start at a random block and
-    # take free blocks upwards, wrapping around. Blocks referenced by any record
-    # still in the index log are treated as used.
+    # Find the index slot first, so we fail before writing any audio.
+    slot = find_record_slot(lp, last_off)
+
+    # Same order as the official tool (0x406ca0): start at a random block, go up,
+    # wrap around, skip blocks referenced by any record still in the index log.
     start = random.randrange(INDEX_BLOCK)
     order = list(range(start, INDEX_BLOCK)) + list(range(0, start))
     candidates = [b for b in order if b not in used]
 
+    # The erase command answers OK but does nothing on this firmware, so only blocks
+    # that are already erased (all FF) can be programmed cleanly. Reserve all of them
+    # before writing anything, so a too-long file fails without wasting blocks.
+    def next_empty():
+        while candidates:
+            blk = candidates.pop(0)
+            try:
+                lp.erase_block(AREA_NAND, blk * BLOCK_SIZE)
+            except DeviceError:
+                pass  # a refused erase is fine: the emptiness check decides
+            if lp.block_is_erased(blk):
+                return blk
+        return None
+
+    reserve = []
+    for n in range(nblocks):
+        blk = next_empty()
+        if blk is None:
+            per_block_s = per_block / SAMPLE_WIDTH / SAMPLE_RATE
+            raise DeviceError(
+                f"not enough empty memory: need {nblocks} blocks ({len(pcm) / SAMPLE_WIDTH / SAMPLE_RATE:.1f} s), "
+                f"found {len(reserve)} (~{len(reserve) * per_block_s:.0f} s). Nothing was written.")
+        reserve.append(blk)
+        if progress:
+            print(f"\r  finding empty memory: {n + 1}/{nblocks} blocks", end="", file=sys.stderr, flush=True)
+    if progress:
+        print(file=sys.stderr)
+
     blocks = []
-    done = 0
-    total_pages = -(-len(pcm) // PAGE_AUDIO)
     pos = 0
     while pos < len(pcm):
-        if not candidates:
-            raise DeviceError("no free NAND blocks left")
-        blk = candidates.pop(0)
-        try:
-            lp.erase_block(AREA_NAND, blk * BLOCK_SIZE)
-        except DeviceError as e:
-            print(f"\n  block {blk}: erase failed ({e}), skipping", file=sys.stderr)
-            continue
+        blk = reserve.pop(0) if reserve else next_empty()
+        if blk is None:
+            raise DeviceError("ran out of empty memory while replacing blocks that failed verification")
+        addr = blk * BLOCK_SIZE
         bi = len(blocks)
-        block_start = pos
+        image = bytearray(b"\xff" * BLOCK_SIZE)
+        block_pcm = pcm[pos:pos + per_block]
         try:
-            for chunk in range(PAGES_PER_BLOCK):
-                if pos >= len(pcm):
-                    break
-                data = pcm[pos:pos + PAGE_AUDIO]
-                lp.write(AREA_NAND, blk * BLOCK_SIZE + page_for_chunk(bi, chunk) * PAGE_SIZE, data)
-                pos += len(data)
-                done += 1
-                if progress and done % 32 == 0:
-                    print(f"\r  {100 * done // total_pages}%", end="", file=sys.stderr, flush=True)
+            for chunk in range(-(-len(block_pcm) // PAGE_AUDIO)):
+                data = block_pcm[chunk * PAGE_AUDIO:(chunk + 1) * PAGE_AUDIO]
+                page = page_for_chunk(bi, chunk)
+                lp.write(AREA_NAND, addr + page * PAGE_SIZE, data)
+                image[page * PAGE_SIZE:page * PAGE_SIZE + len(data)] = data
+            ok = lp.checksum(AREA_NAND, addr, BLOCK_SIZE) == sum(image) & 0xFFFF
         except DeviceError as e:
-            print(f"\n  block {blk}: write failed ({e}), retrying on another block", file=sys.stderr)
-            done -= -(-(pos - block_start) // PAGE_AUDIO)
-            pos = block_start
+            print(f"\n  block {blk}: {e}", file=sys.stderr)
+            ok = False
+        if not ok:
+            print(f"\n  block {blk}: verify failed, using another block", file=sys.stderr)
+            used.add(blk)
             continue
         blocks.append(blk)
+        pos += len(block_pcm)
+        if progress:
+            print(f"\r  writing: {100 * pos // len(pcm)}%  (block {len(blocks)}/{nblocks})",
+                  end="", file=sys.stderr, flush=True)
     if progress:
-        print("\r  100%", file=sys.stderr)
+        print(file=sys.stderr)
 
-    # Append the new record to the index log; erase the log block when full (0x407cfa).
-    slot = 0 if last_off is None else last_off // PAGE_SIZE + 2
-    if slot >= PAGES_PER_BLOCK:
-        lp.erase_block(AREA_NAND, INDEX_BLOCK * BLOCK_SIZE)
-        slot = 0
-    lp.write(AREA_NAND, INDEX_BLOCK * BLOCK_SIZE + slot * PAGE_SIZE, build_record(len(pcm), blocks))
+    rec = build_record(len(pcm), blocks)
+    lp.write(AREA_NAND, INDEX_BLOCK * BLOCK_SIZE + slot * PAGE_SIZE, rec)
+    if lp.read(AREA_NAND, INDEX_BLOCK * BLOCK_SIZE + slot * PAGE_SIZE, 0x60) != rec[:0x60]:
+        raise DeviceError("index record did not read back correctly")
     return blocks
+
+
+def find_record_slot(lp: Looper, last_off):
+    """Next erased 2-page slot after the newest record in the index block."""
+    first = 0 if last_off is None else last_off // PAGE_SIZE + 2
+    base = INDEX_BLOCK * BLOCK_SIZE
+    for slot in range(first, PAGES_PER_BLOCK - 1, 2):
+        a = base + slot * PAGE_SIZE
+        if lp.checksum(AREA_NAND, a, RECORD_SIZE) == (0xFF * RECORD_SIZE) & 0xFFFF and \
+                lp.read(AREA_NAND, a, 16) == b"\xff" * 16:
+            return slot
+    # The official tool erases the index block here (0x407cfa), but erase does
+    # nothing on this firmware. Recording a loop on the pedal makes it rotate
+    # its own index, which frees slots again.
+    raise DeviceError("loop index block is full; record any loop on the pedal once, then retry")
 
 
 def write_wav(path: str, pcm: bytes, rate=SAMPLE_RATE):
@@ -403,35 +516,77 @@ def write_wav(path: str, pcm: bytes, rate=SAMPLE_RATE):
 # ---------------------------------------------------------------- CLI
 
 def cmd_info(lp, args):
-    print("device info:", lp.info().hex(" "))
+    info = lp.info()
     model = int.from_bytes(lp.read(AREA_MCU, 0x2180, 16)[4:8], "little")
-    print(f"model id: 0x{model:04x}" + (" (NANO LOOPER)" if model == 0x2715 else " (not a NANO LOOPER!)"))
     loop = current_loop(lp)
-    if not loop:
-        print("no loop stored")
-        return
-    secs = loop["length"] / SAMPLE_WIDTH / SAMPLE_RATE
-    print(f"loop: {secs:.2f} s, {loop['length']} bytes, {len(loop['blocks'])} blocks "
-          f"(first {loop['blocks'][0]}), index record #{loop['seq']:#x} at +{loop['offset']:#x}")
+    ok = model == 0x2715
+    rows = [
+        ("device", f"{VID:04x}:{PID:04x}  bus {lp.dev.bus} addr {lp.dev.address}", None),
+        ("model", f"0x{model:04x} " + ("NANO LOOPER" if ok else "unknown"), "32" if ok else "31"),
+        ("info", info[:16].decode("ascii", "replace") + " " + info[16:].hex(" "), "2"),
+        ("format", f"mono  24-bit  {SAMPLE_RATE} Hz", None),
+    ]
+    if loop:
+        secs = loop["length"] / SAMPLE_WIDTH / SAMPLE_RATE
+        rows += [
+            ("loop", f"▶ {secs:.2f} s", "1;32"),
+            ("size", f"{loop['length']} B  {len(loop['blocks'])} blocks  first {loop['blocks'][0]}", None),
+            ("index", f"record @ +{loop['offset']:#x}  seq {loop['seq']:#x}", "2"),
+        ]
+    else:
+        rows.append(("loop", "■ none", "1;31"))
+    for key, val, color in rows:
+        print(f"{_color('1', f'{key:<7}')} {_color(color, val) if color else val}")
+
+
+def _color(code: str, text: str) -> str:
+    import os
+    if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+STATES = {  # key: (icon, label, ANSI color, legend)
+    "playing": ("▶", "playing", "1;32", "loop the pedal plays now"),
+    "saved": ("●", "saved", "36", "old loop, not playing, audio still in memory -> select N / download -r N"),
+    "damaged": ("⚠", "damaged", "33", "old loop, N/M blocks overwritten by a later one"),
+    "dup": ("↺", "duplicate", "2", "same audio as another entry"),
+}
 
 
 def cmd_list(lp, args):
     recs = all_records(lp)
+    current = next((i for i, r in enumerate(recs) if r["current"]), None)
+    if current is None:
+        print(_color("1;31", "■ no loop"))
+    else:
+        secs = recs[current]["length"] / SAMPLE_WIDTH / SAMPLE_RATE
+        print(_color("1;32", f"▶ playing #{current}  {secs:.2f} s"))
     if not recs:
-        print("no loops in the index")
         return
-    print(" #  length   blocks  first  note")
+    print()
+    print(_color("1", " #    length  blocks  state"))
+    seen = []
     for i, r in enumerate(recs):
         secs = r["length"] / SAMPLE_WIDTH / SAMPLE_RATE
-        if i == len(recs) - 1:
-            note = "CURRENT (the loop the pedal plays)"
+        if r["current"]:
+            key, extra = "playing", ""
         elif r["same_as"] is not None:
-            note = f"same audio as #{r['same_as']}"
+            key, extra = "dup", f" of #{r['same_as']}"
         elif r["overwritten"]:
-            note = f"{r['overwritten']}/{len(r['blocks'])} blocks reused later (partly overwritten)"
+            key, extra = "damaged", f" {r['overwritten']}/{len(r['blocks'])}"
         else:
-            note = "old loop, probably intact"
-        print(f"{i:2d}  {secs:6.2f}s  {len(r['blocks']):6d}  {r['blocks'][0]:5d}  {note}")
+            key, extra = "saved", ""
+        icon, label, color, _ = STATES[key]
+        print(f"{i:2d}  {secs:7.2f}s  {len(r['blocks']):6d}  " + _color(color, f"{icon} {label}{extra}"))
+        if key not in seen:
+            seen.append(key)
+    print()
+    for key in seen:
+        icon, label, color, legend = STATES[key]
+        print(_color("2", f"{icon} {label:<9} {legend}"))
+    if "saved" in seen:
+        print(_color("2", "  history stays until the pedal compacts its index (seen when the log was half full)"))
 
 
 def cmd_download(lp, args):
@@ -442,7 +597,7 @@ def cmd_download(lp, args):
         for i, r in enumerate(recs):
             if r["same_as"] is not None:
                 continue
-            path = os.path.join(args.file, f"loop{i:02d}{'-current' if i == len(recs) - 1 else ''}.wav")
+            path = os.path.join(args.file, f"loop{i:02d}{'-current' if r['current'] else ''}.wav")
             print(f"#{i}: {r['length'] / SAMPLE_WIDTH / SAMPLE_RATE:.2f} s -> {path}", file=sys.stderr)
             write_wav(path, read_loop_pcm(lp, r))
         return
@@ -462,23 +617,86 @@ def cmd_download(lp, args):
 
 
 def cmd_upload(lp, args):
-    if not args.experimental:
-        raise DeviceError(
-            "upload is not working yet: the erase command (0x21) replies OK but does not erase "
-            "NAND blocks, so new audio gets ANDed with old data. See README 'Upload status'. "
-            "Pass --experimental to run it anyway.")
-    model =int.from_bytes(lp.read(AREA_MCU, 0x2180, 16)[4:8], "little")
+    model = int.from_bytes(lp.read(AREA_MCU, 0x2180, 16)[4:8], "little")
     if model != 0x2715 and not args.force:
         raise DeviceError(f"model id 0x{model:04x} is not a NANO LOOPER (0x2715); refusing to write (--force)")
     pcm = load_audio(args.file)
     secs = len(pcm) / SAMPLE_WIDTH / SAMPLE_RATE
     print(f"uploading {args.file} ({secs:.2f} s); this replaces the loop on the pedal", file=sys.stderr)
     blocks = upload_loop(lp, pcm)
-    loop = current_loop(lp)
-    if not loop or loop["blocks"] != blocks:
-        raise DeviceError("index record did not read back correctly")
     print(f"done: {len(blocks)} blocks written. Unplug/replug the pedal so it reloads the loop.",
           file=sys.stderr)
+
+
+def cmd_select(lp, args):
+    recs = all_records(lp)
+    if not 0 <= args.record < len(recs):
+        raise DeviceError(f"no record #{args.record} (see 'list')")
+    r = recs[args.record]
+    if r["overwritten"]:
+        print(f"warning: {r['overwritten']} blocks of loop #{args.record} were reused later; "
+              "it will play partly corrupted", file=sys.stderr)
+    _, last_off, _ = scan_index(lp)
+    slot = find_record_slot(lp, last_off)
+    rec = build_record(r["length"], r["blocks"])
+    lp.write(AREA_NAND, INDEX_BLOCK * BLOCK_SIZE + slot * PAGE_SIZE, rec)
+    print(f"loop #{args.record} ({r['length'] / SAMPLE_WIDTH / SAMPLE_RATE:.2f} s) is now current. "
+          "Unplug/replug the pedal so it reloads the loop.", file=sys.stderr)
+
+
+def build_clear_record() -> bytes:
+    """Record with the valid flag at 0: the pedal then has no loop (it writes the same when
+    you clear the loop with the footswitch)."""
+    rec = bytearray(b"\xff" * RECORD_SIZE)
+    rec[0:7] = b"looper\x00"
+    rec[RECORD_SIZE - 8:RECORD_SIZE - 1] = b"looper\x00"
+    rec[8] = 0
+    return bytes(rec)
+
+
+def cmd_clear(lp, args):
+    current, last_off, _ = scan_index(lp)
+    if not current and not args.yes:
+        print("the pedal already has no loop", file=sys.stderr)
+        return
+    if not args.yes:
+        secs = current["length"] / SAMPLE_WIDTH / SAMPLE_RATE
+        answer = input(f"remove the current {secs:.2f} s loop from the pedal? "
+                       "(it stays in 'list' and can come back with 'select') [y/N] ")
+        if answer.strip().lower() not in ("y", "yes", "s", "si", "sì"):
+            print("aborted", file=sys.stderr)
+            return
+    slot = find_record_slot(lp, last_off)
+    rec = build_clear_record()
+    lp.write(AREA_NAND, INDEX_BLOCK * BLOCK_SIZE + slot * PAGE_SIZE, rec)
+    if scan_index(lp)[0] is not None:
+        raise DeviceError("clear record did not take effect")
+    print("the pedal now has no loop. Unplug/replug the pedal so it reloads.", file=sys.stderr)
+
+
+def cmd_space(lp, args):
+    _, last_off, used = scan_index(lp)
+    free = 0
+    for blk in range(INDEX_BLOCK):
+        if blk not in used and lp.block_is_erased(blk):
+            free += 1
+        if blk % 20 == 0:
+            print(f"\r  scanning block {blk}/{INDEX_BLOCK}, {free} empty so far",
+                  end="", file=sys.stderr, flush=True)
+    print(file=sys.stderr)
+    per_block_s = PAGE_AUDIO * PAGES_PER_BLOCK / SAMPLE_WIDTH / SAMPLE_RATE
+    slots = 0
+    base = INDEX_BLOCK * BLOCK_SIZE
+    first = 0 if last_off is None else last_off // PAGE_SIZE + 2
+    for slot in range(first, PAGES_PER_BLOCK - 1, 2):
+        if lp.checksum(AREA_NAND, base + slot * PAGE_SIZE, RECORD_SIZE) == (0xFF * RECORD_SIZE) & 0xFFFF:
+            slots += 1
+    total_s = free * per_block_s
+    max_s = min(free, MAX_BLOCKS) * per_block_s
+    col = "32" if free > 60 else "33" if free > 10 else "31"
+    print(f"{_color('1', 'free   ')} {_color(col, f'{free} blocks  ~{total_s:.0f} s of audio')}")
+    print(f"{_color('1', 'max    ')} {max_s:.0f} s per upload (pedal limit {MAX_BLOCKS * per_block_s / 60:.0f} min)")
+    print(f"{_color('1', 'slots  ')} {_color('32' if slots > 3 else '31', str(slots))} free in the index (upload/select/clear use 1)")
 
 
 def cmd_probe(lp, args):
@@ -496,49 +714,169 @@ def cmd_dump(lp, args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Ammoon AP-09 nano looper USB tool")
-    sub = ap.add_subparsers(dest="command", required=True)
+    fmt = argparse.RawDescriptionHelpFormatter
+    ap = argparse.ArgumentParser(
+        prog="ap09.py", formatter_class=fmt,
+        description="Copy loops between an Ammoon AP-09 nano looper (USB 0416:5555) and this computer.",
+        epilog="""\
+typical use:
+  ap09.py info                     what is on the pedal
+  ap09.py list                     current loop + older loops still in memory
+  ap09.py download loop.wav        save the current loop
+  ap09.py upload song.mp3          put an audio file on the pedal
+  ap09.py select 3                 play old loop #3 again
+  ap09.py clear                    leave the pedal without a loop
 
-    sub.add_parser("info", help="show device and stored loop info").set_defaults(func=cmd_info)
+After upload / select / clear: unplug and replug the pedal so it reloads.
+Audio on the pedal: mono, 24-bit, 46875 Hz. Run 'ap09.py COMMAND -h' for details.
+Without the udev rule (see README) every command needs sudo.""")
+    sub = ap.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
-    sub.add_parser("list", help="list the current loop and older loops still in the index") \
-        .set_defaults(func=cmd_list)
+    p = sub.add_parser(
+        "info", formatter_class=fmt, help="show device model and the current loop",
+        description="""\
+Show the device info block, the model id (must be 0x2715 = NANO LOOPER) and the
+loop the pedal currently plays: length, size, memory blocks and where its index
+record is. Read-only.""")
+    p.set_defaults(func=cmd_info)
 
-    p = sub.add_parser("download", help="save the loop stored on the pedal as a WAV file")
-    p.add_argument("file", help="output WAV (or output directory with --all)")
-    p.add_argument("-r", "--record", type=int, help="download an older loop (number from 'list')")
-    p.add_argument("-a", "--all", action="store_true", help="download every loop in the index into directory FILE")
+    p = sub.add_parser(
+        "list", formatter_class=fmt, help="list current and older loops still in memory",
+        description="""\
+List every loop recorded in the pedal's index, oldest first. The pedal plays only
+the one marked CURRENT; the older ones usually still have their audio in memory
+and can be downloaded (download -r N) or made current again (select N).
+
+notes:
+  same audio as #N      duplicate record pointing to the same audio
+  partly overwritten    some of its memory blocks were reused by a later loop
+Read-only.""")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser(
+        "download", formatter_class=fmt, help="save a loop from the pedal as WAV",
+        description="""\
+Save a loop as a WAV file: mono, 24-bit PCM, 46875 Hz (the pedal's native
+format, bit-exact). About 12 s for a 20 s loop. Read-only on the pedal.
+
+examples:
+  ap09.py download loop.wav          current loop
+  ap09.py download -r 3 old.wav      loop #3 from 'list'
+  ap09.py download -a myloops/       every loop into myloops/loopNN.wav
+
+convert afterwards if needed:
+  ffmpeg -i loop.wav -ar 48000 loop48k.wav
+  ffmpeg -i loop.wav -b:a 320k loop.mp3""")
+    p.add_argument("file", help="output WAV file (a directory with --all)")
+    p.add_argument("-r", "--record", type=int, metavar="N", help="download loop #N from 'list' instead of the current one")
+    p.add_argument("-a", "--all", action="store_true", help="download every loop into directory FILE")
     p.set_defaults(func=cmd_download)
 
-    p = sub.add_parser("upload", help="replace the loop on the pedal with an audio file (wav/mp3/flac/...)")
-    p.add_argument("file")
-    p.add_argument("--force", action="store_true", help="write even if the model id is not NANO LOOPER")
-    p.add_argument("--experimental", action="store_true", help="run the (currently broken) upload anyway")
+    p = sub.add_parser(
+        "upload", formatter_class=fmt, help="put an audio file on the pedal as the current loop",
+        description="""\
+Write an audio file to the pedal and make it the current loop.
+
+input: anything ffmpeg can read (wav, mp3, flac, ogg, ...). It is converted to
+mono, 24-bit, 46875 Hz; stereo is mixed down. A WAV already in that format is
+sent as-is (no ffmpeg needed). Max ~10 min, in practice limited by free space.
+
+how: the pedal's erase command does not work, so only memory blocks that are
+already empty are used (check with 'space'); every block is verified with the
+pedal's checksum. The previous loop is NOT deleted: it stays in 'list' and can
+come back with 'select'. Takes ~1 s per second of audio.
+
+After the upload unplug and replug the pedal.""")
+    p.add_argument("file", help="audio file to upload")
+    p.add_argument("--force", action="store_true", help="write even if the model id is not NANO LOOPER (0x2715)")
     p.set_defaults(func=cmd_upload)
 
-    p = sub.add_parser("dump", help="(debug) read raw memory")
+    p = sub.add_parser(
+        "select", formatter_class=fmt, help="make an older loop from 'list' current again",
+        description="""\
+Make loop #N from 'list' the current loop. No audio is copied: a new index
+record pointing at that loop's memory is added. If 'list' says the loop was
+partly overwritten, it will play partly corrupted. Uses one index slot.
+
+After select unplug and replug the pedal.""")
+    p.add_argument("record", type=int, metavar="N", help="loop number from 'list'")
+    p.set_defaults(func=cmd_select)
+
+    p = sub.add_parser(
+        "clear", formatter_class=fmt, help="leave the pedal without a loop",
+        description="""\
+Remove the current loop, like clearing it on the pedal: a 'no loop' record is
+added to the index. Asks for confirmation unless -y is given.
+
+limits: the audio itself cannot be wiped over USB (the erase command is ignored).
+Older loops stay in 'list' as history and can be brought back with 'select'
+until the pedal compacts its index (observed once at power-on, when the index
+log was half full); the audio stays in memory until it gets reused.
+
+After clear unplug and replug the pedal.""")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    p.set_defaults(func=cmd_clear)
+
+    p = sub.add_parser(
+        "space", formatter_class=fmt, help="how much empty memory is left for uploads (~4 min)",
+        description="""\
+Scan the whole audio memory (1980 blocks, ~0.1 s each, ~4 min) and report how
+many blocks are empty, i.e. usable by 'upload', and how many index slots are
+free (upload, select and clear each use one). Read-only.""")
+    p.set_defaults(func=cmd_space)
+
+    p = sub.add_parser(
+        "dump", formatter_class=fmt, help="(debug) read raw memory",
+        description="""\
+Read raw memory and print it as hex (or save it with -o). Read-only.
+
+areas: 0 = MCU flash (firmware/settings), 1 = 256 MiB NAND (audio + index)
+examples:
+  ap09.py dump 1 0xF780000 0x60      first index record
+  ap09.py dump 0 0x2180 16           model id is bytes 4..7""")
     p.add_argument("area", help="0 = MCU flash, 1 = NAND")
-    p.add_argument("addr")
-    p.add_argument("length")
-    p.add_argument("-o", "--out")
+    p.add_argument("addr", help="start address (e.g. 0xF780000)")
+    p.add_argument("length", help="number of bytes (e.g. 0x60)")
+    p.add_argument("-o", "--out", metavar="FILE", help="write raw bytes to FILE instead of printing")
     p.set_defaults(func=cmd_dump)
 
-    p = sub.add_parser("probe", help="(debug) send a raw command, e.g. probe 11")
-    p.add_argument("cmd", help="command byte, hex")
+    p = sub.add_parser(
+        "probe", formatter_class=fmt, help="(debug) send a raw protocol command",
+        description="""\
+Send one raw command packet and print the reply body (see README, 'Packet
+format'). Only for protocol work: 0x21/0x22 write to the pedal.
+
+examples:
+  ap09.py probe 11                                   device info
+  ap09.py probe 23 010000780f600000                  read 0x60 bytes of NAND at 0xF780000""")
+    p.add_argument("cmd", help="command byte, hex (e.g. 11)")
     p.add_argument("body", nargs="?", help="body bytes, hex")
     p.set_defaults(func=cmd_probe)
 
     args = ap.parse_args()
+    # check the input before touching the pedal
+    if args.command == "upload":
+        import os
+        if not os.path.isfile(args.file):
+            sys.exit(f"error: file not found: {args.file}")
     try:
         lp = Looper()
     except usb.core.USBError as e:
-        sys.exit(f"error: cannot open device: {e} (run with sudo or install the udev rule)")
+        if e.errno == 16:
+            sys.exit("error: pedal busy: another ap09.py (or program) is using it; wait for it to finish")
+        if e.errno == 13:
+            sys.exit("error: permission denied: run with sudo or install the udev rule (see README)")
+        sys.exit(f"error: cannot open device: {e}; unplug/replug the pedal and retry")
     except DeviceError as e:
         sys.exit(f"error: {e}")
     try:
         args.func(lp, args)
     except DeviceError as e:
         sys.exit(f"error: {e}")
+    except OSError as e:  # file errors (permissions, missing directory, disk full, ...)
+        sys.exit(f"error: {e.strerror or e}: {e.filename or ''}".rstrip(": "))
+    except KeyboardInterrupt:
+        sys.exit("interrupted")
     finally:
         lp.close()
 
