@@ -147,7 +147,7 @@ class Looper:
                 self.dev.reset()
                 usb.util.claim_interface(self.dev, INTERFACE)
             except usb.core.USBError as e:
-                raise DeviceError(f"pedal not responding and USB reset failed ({e}); unplug/replug it")
+                raise DeviceError(f"pedal not responding and USB reset failed ({e}); unplug/replug it") from e
 
     def close(self):
         try:
@@ -329,6 +329,14 @@ def page_for_chunk(block_index: int, chunk: int) -> int:
     return chunk
 
 
+def _report(progress, fraction: float, text: str, end=False):
+    """progress: True = print to stderr, callable(fraction, text) = GUI, falsy = silent."""
+    if callable(progress):
+        progress(fraction, text)
+    elif progress:
+        print(f"\r  {text}", end="\n" if end else "", file=sys.stderr, flush=True)
+
+
 def read_loop_pcm(lp: Looper, loop, progress=True) -> bytes:
     pcm = bytearray()
     remaining = loop["length"]
@@ -343,10 +351,9 @@ def read_loop_pcm(lp: Looper, loop, progress=True) -> bytes:
             pcm += lp.read(AREA_NAND, blk * BLOCK_SIZE + page * PAGE_SIZE, n)
             remaining -= n
             done += 1
-            if progress and done % 64 == 0:
-                print(f"\r  {100 * done // total_pages}%", end="", file=sys.stderr, flush=True)
-    if progress:
-        print("\r  100%", file=sys.stderr)
+            if done % 16 == 0:
+                _report(progress, done / total_pages, f"{100 * done // total_pages}%")
+    _report(progress, 1.0, "100%", end=True)
     return bytes(pcm)
 
 
@@ -446,10 +453,8 @@ def upload_loop(lp: Looper, pcm: bytes, progress=True):
                 f"not enough empty memory: need {nblocks} blocks ({len(pcm) / SAMPLE_WIDTH / SAMPLE_RATE:.1f} s), "
                 f"found {len(reserve)} (~{len(reserve) * per_block_s:.0f} s). Nothing was written.")
         reserve.append(blk)
-        if progress:
-            print(f"\r  finding empty memory: {n + 1}/{nblocks} blocks", end="", file=sys.stderr, flush=True)
-    if progress:
-        print(file=sys.stderr)
+        _report(progress, 0.1 * (n + 1) / nblocks, f"finding empty memory: {n + 1}/{nblocks} blocks",
+                end=n + 1 == nblocks)
 
     blocks = []
     pos = 0
@@ -477,11 +482,8 @@ def upload_loop(lp: Looper, pcm: bytes, progress=True):
             continue
         blocks.append(blk)
         pos += len(block_pcm)
-        if progress:
-            print(f"\r  writing: {100 * pos // len(pcm)}%  (block {len(blocks)}/{nblocks})",
-                  end="", file=sys.stderr, flush=True)
-    if progress:
-        print(file=sys.stderr)
+        _report(progress, 0.1 + 0.9 * pos / len(pcm),
+                f"writing: {100 * pos // len(pcm)}%  (block {len(blocks)}/{nblocks})", end=pos >= len(pcm))
 
     rec = build_record(len(pcm), blocks)
     lp.write(AREA_NAND, INDEX_BLOCK * BLOCK_SIZE + slot * PAGE_SIZE, rec)
@@ -636,12 +638,31 @@ def cmd_select(lp, args):
     if r["overwritten"]:
         print(f"warning: {r['overwritten']} blocks of loop #{args.record} were reused later; "
               "it will play partly corrupted", file=sys.stderr)
-    _, last_off, _ = scan_index(lp)
-    slot = find_record_slot(lp, last_off)
-    rec = build_record(r["length"], r["blocks"])
-    lp.write(AREA_NAND, INDEX_BLOCK * BLOCK_SIZE + slot * PAGE_SIZE, rec)
+    select_loop(lp, r)
     print(f"loop #{args.record} ({r['length'] / SAMPLE_WIDTH / SAMPLE_RATE:.2f} s) is now current. "
           "Unplug/replug the pedal so it reloads the loop.", file=sys.stderr)
+
+
+def append_record(lp: Looper, rec: bytes):
+    """Write a record into the next empty slot of the index log and read it back."""
+    _, last_off, _ = scan_index(lp)
+    slot = find_record_slot(lp, last_off)
+    addr = INDEX_BLOCK * BLOCK_SIZE + slot * PAGE_SIZE
+    lp.write(AREA_NAND, addr, rec)
+    if lp.read(AREA_NAND, addr, 0x60) != rec[:0x60]:
+        raise DeviceError("index record did not read back correctly")
+
+
+def select_loop(lp: Looper, loop):
+    """Make an existing loop (from all_records) the current one."""
+    append_record(lp, build_record(loop["length"], loop["blocks"]))
+
+
+def clear_loop(lp: Looper):
+    """Leave the pedal without a loop (audio stays in memory as history)."""
+    append_record(lp, build_clear_record())
+    if scan_index(lp)[0] is not None:
+        raise DeviceError("clear record did not take effect")
 
 
 def build_clear_record() -> bytes:
@@ -666,37 +687,42 @@ def cmd_clear(lp, args):
         if answer.strip().lower() not in ("y", "yes", "s", "si", "sì"):
             print("aborted", file=sys.stderr)
             return
-    slot = find_record_slot(lp, last_off)
-    rec = build_clear_record()
-    lp.write(AREA_NAND, INDEX_BLOCK * BLOCK_SIZE + slot * PAGE_SIZE, rec)
-    if scan_index(lp)[0] is not None:
-        raise DeviceError("clear record did not take effect")
+    clear_loop(lp)
     print("the pedal now has no loop. Unplug/replug the pedal so it reloads.", file=sys.stderr)
 
 
-def cmd_space(lp, args):
+PER_BLOCK_S = PAGE_AUDIO * PAGES_PER_BLOCK / SAMPLE_WIDTH / SAMPLE_RATE  # ~0.93 s of audio per block
+
+
+def count_space(lp: Looper, progress=True):
+    """Return (empty_blocks, free_index_slots). Full scan, ~0.1 s per block."""
     _, last_off, used = scan_index(lp)
     free = 0
     for blk in range(INDEX_BLOCK):
         if blk not in used and lp.block_is_erased(blk):
             free += 1
         if blk % 20 == 0:
-            print(f"\r  scanning block {blk}/{INDEX_BLOCK}, {free} empty so far",
-                  end="", file=sys.stderr, flush=True)
-    print(file=sys.stderr)
-    per_block_s = PAGE_AUDIO * PAGES_PER_BLOCK / SAMPLE_WIDTH / SAMPLE_RATE
+            _report(progress, blk / INDEX_BLOCK, f"scanning block {blk}/{INDEX_BLOCK}, {free} empty so far")
+    _report(progress, 1.0, f"scanned {INDEX_BLOCK} blocks, {free} empty", end=True)
     slots = 0
     base = INDEX_BLOCK * BLOCK_SIZE
     first = 0 if last_off is None else last_off // PAGE_SIZE + 2
     for slot in range(first, PAGES_PER_BLOCK - 1, 2):
         if lp.checksum(AREA_NAND, base + slot * PAGE_SIZE, RECORD_SIZE) == (0xFF * RECORD_SIZE) & 0xFFFF:
             slots += 1
+    return free, slots
+
+
+def cmd_space(lp, args):
+    free, slots = count_space(lp)
+    per_block_s = PER_BLOCK_S
     total_s = free * per_block_s
     max_s = min(free, MAX_BLOCKS) * per_block_s
     col = "32" if free > 60 else "33" if free > 10 else "31"
     print(f"{_color('1', 'free   ')} {_color(col, f'{free} blocks  ~{total_s:.0f} s of audio')}")
     print(f"{_color('1', 'max    ')} {max_s:.0f} s per upload (pedal limit {MAX_BLOCKS * per_block_s / 60:.0f} min)")
-    print(f"{_color('1', 'slots  ')} {_color('32' if slots > 3 else '31', str(slots))} free in the index (upload/select/clear use 1)")
+    slots_txt = _color("32" if slots > 3 else "31", str(slots))
+    print(f"{_color('1', 'slots  ')} {slots_txt} free in the index (upload/select/clear use 1)")
 
 
 def cmd_probe(lp, args):
@@ -707,7 +733,8 @@ def cmd_probe(lp, args):
 def cmd_dump(lp, args):
     data = lp.read(int(args.area), int(args.addr, 0), int(args.length, 0))
     if args.out:
-        open(args.out, "wb").write(data)
+        with open(args.out, "wb") as f:
+            f.write(data)
     else:
         for i in range(0, len(data), 16):
             print(f"{int(args.addr, 0) + i:08x}: {data[i:i + 16].hex(' ')}")
@@ -768,7 +795,8 @@ convert afterwards if needed:
   ffmpeg -i loop.wav -ar 48000 loop48k.wav
   ffmpeg -i loop.wav -b:a 320k loop.mp3""")
     p.add_argument("file", help="output WAV file (a directory with --all)")
-    p.add_argument("-r", "--record", type=int, metavar="N", help="download loop #N from 'list' instead of the current one")
+    p.add_argument("-r", "--record", type=int, metavar="N",
+                   help="download loop #N from 'list' instead of the current one")
     p.add_argument("-a", "--all", action="store_true", help="download every loop into directory FILE")
     p.set_defaults(func=cmd_download)
 

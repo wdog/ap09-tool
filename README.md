@@ -15,6 +15,58 @@ Versions: tag `v0.1-download` = download only. Branch `upload` = download + uplo
 
 ---
 
+## 0. Graphical app (GTK4)
+
+```
+python3 ap09_gui.py
+```
+
+![GUI](docs/gui.png)
+
+Requirements (Debian/Ubuntu), in addition to `python3-usb` and `ffmpeg` from the CLI
+section:
+
+```
+sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 \
+                 gir1.2-gstreamer-1.0 gstreamer1.0-plugins-good python3-numpy
+```
+
+| package | used for |
+|---|---|
+| `python3-gi`, `gir1.2-gtk-4.0`, `gir1.2-adw-1` | the window (GTK 4 + libadwaita ≥ 1.5 for dialogs) |
+| `gir1.2-gstreamer-1.0`, `gstreamer1.0-plugins-good` | playing loops on the computer |
+| `python3-numpy` | waveforms |
+| `python3-usb` | talking to the pedal |
+| `ffmpeg` | converting mp3/flac/… on upload |
+
+What it does:
+
+- **Detects the pedal automatically** when you plug it in (it checks every 2 s).
+- **On the pedal** card: the current loop with its length, waveform, ▶ play,
+  💾 save as WAV, ✖ clear.
+- **Upload**: drag an audio file onto the window, or click the drop zone / **Upload**
+  (Ctrl+O). A preview with the waveform and length comes first, then a confirmation.
+  Progress shows under the header bar.
+- **Loops in memory**: every older loop with a state badge (in memory / damaged /
+  duplicate), a small waveform, ▶ play, 💾 save, and **Put on pedal** (`select`).
+- **Player bar** at the bottom: play/pause, click the waveform to seek, stop.
+- **Memory**: free space scan (about 4 min) with a level bar, device info.
+- Menu: scan space, clear, download all loops to a folder, open the cache.
+- Keys: **F5** refresh, **Space** play/pause, **Ctrl+O** upload.
+
+Audio loaded from the pedal is cached in `~/.cache/ap09/`, so it is read over USB only
+once. All pedal access goes through one background thread, and the window never
+freezes. **Don't run the CLI while the app is working on the pedal**: the pedal serves
+one client at a time.
+
+Launcher for the app menu (optional):
+
+```
+sed "s#@DIR@#$PWD#g" ap09-gui.desktop > ~/.local/share/applications/ap09-gui.desktop
+```
+
+---
+
 ## 1. How to use it
 
 ### Requirements
@@ -392,7 +444,10 @@ the loop**. That one is rotated by one page: chunk 0 → page 63, chunk k → pa
 
 ### Files
 
-- `ap09.py` — the tool (transport, protocol, index parsing, download, upload, select).
+- `ap09.py` — CLI and core library (transport, protocol, index parsing, download, upload, select, clear, space).
+- `ap09_gui.py` — GTK4/libadwaita app built on `ap09.py`.
+- `ap09-gui.desktop` — launcher template (`@DIR@` = project folder).
+- `ruff.toml` — lint config: `ruff check .` (ruff via `pipx install ruff`).
 - `PROTOCOL.md` — early notes, now **superseded by this README**.
 - `backup-original-loop.wav` — backup of the loop that was on the pedal.
 - `re/` (not in git) — `Looper Software.exe` from the official installer and its `objdump -d` output (`looper_disasm.txt`).
