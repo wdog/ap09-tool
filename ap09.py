@@ -356,6 +356,11 @@ def load_audio(path: str) -> bytes:
     A WAV already in the pedal's format is read directly; anything else
     (other WAV formats, mp3, flac, ...) is converted with ffmpeg.
     """
+    import os
+    if not os.path.isfile(path):
+        raise DeviceError(f"file not found: {path}")
+    if not os.access(path, os.R_OK):
+        raise DeviceError(f"cannot read file: {path}")
     try:
         with wave.open(path, "rb") as w:
             if (w.getnchannels(), w.getsampwidth(), w.getframerate()) == (1, SAMPLE_WIDTH, SAMPLE_RATE):
@@ -828,16 +833,29 @@ examples:
     p.set_defaults(func=cmd_probe)
 
     args = ap.parse_args()
+    # check the input before touching the pedal
+    if args.command == "upload":
+        import os
+        if not os.path.isfile(args.file):
+            sys.exit(f"error: file not found: {args.file}")
     try:
         lp = Looper()
     except usb.core.USBError as e:
-        sys.exit(f"error: cannot open device: {e} (run with sudo or install the udev rule)")
+        if e.errno == 16:
+            sys.exit("error: pedal busy: another ap09.py (or program) is using it; wait for it to finish")
+        if e.errno == 13:
+            sys.exit("error: permission denied: run with sudo or install the udev rule (see README)")
+        sys.exit(f"error: cannot open device: {e}; unplug/replug the pedal and retry")
     except DeviceError as e:
         sys.exit(f"error: {e}")
     try:
         args.func(lp, args)
     except DeviceError as e:
         sys.exit(f"error: {e}")
+    except OSError as e:  # file errors (permissions, missing directory, disk full, ...)
+        sys.exit(f"error: {e.strerror or e}: {e.filename or ''}".rstrip(": "))
+    except KeyboardInterrupt:
+        sys.exit("interrupted")
     finally:
         lp.close()
 
