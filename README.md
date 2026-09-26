@@ -34,10 +34,28 @@ model id: 0x2715 (NANO LOOPER)
 loop: 19.91 s, 2799858 bytes, 22 blocks (first 1661), index record #0x696 at +0xc000
 ```
 
-### Download the loop
+### List the loops
+
+The pedal plays **one** loop, the current one. Its index also keeps the loops you
+recorded before, and their audio usually stays in memory until it gets reused:
 
 ```
-sudo python3 ap09.py download myloop.wav
+sudo python3 ap09.py list
+```
+
+```
+ #  length   blocks  first  note
+ 0   13.93s      15   1536  old loop, probably intact
+ ...
+ 8   19.91s      22   1661  CURRENT (the loop the pedal plays)
+```
+
+### Download a loop
+
+```
+sudo python3 ap09.py download myloop.wav          # current loop
+sudo python3 ap09.py download -r 3 old3.wav       # loop #3 from 'list'
+sudo python3 ap09.py download -a myloops/         # all of them into a folder
 ```
 
 It takes about 12 s for a 20 s loop. The file you get is exactly what the pedal stores:
@@ -245,3 +263,4 @@ the loop**. That one is rotated by one page: chunk 0 → page 63, chunk k → pa
 - `ap09.py` — the tool (transport, protocol, index parsing, download, upload).
 - `PROTOCOL.md` — early notes, now **superseded by this README**.
 - `backup-original-loop.wav` — backup of the loop that was on the pedal.
+- `re/` (not in git) — `Looper Software.exe` from the official installer and its `objdump -d` output (`looper_disasm.txt`).

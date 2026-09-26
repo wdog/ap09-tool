@@ -3,3 +3,4 @@ __pycache__/
 *.wav
 !backup-original-loop.wav
 *.syx
+re/

@@ -226,6 +226,26 @@ def scan_index(lp: Looper):
     return current, last_off, used
 
 
+def all_records(lp: Looper):
+    """Every valid record in the index log, oldest first (the last one is the current loop)."""
+    recs = []
+    for off in range(0, BLOCK_SIZE, RECORD_STRIDE):
+        rec = lp.read(AREA_NAND, INDEX_BLOCK * BLOCK_SIZE + off, 0x60)
+        if rec[:6] == b"\xff" * 6:
+            break
+        r = parse_record(rec)
+        if r:
+            r["offset"] = off
+            recs.append(r)
+    # A later record for a different loop that reuses a block overwrote that block's audio.
+    for i, r in enumerate(recs):
+        r["same_as"] = next((j for j in range(i + 1, len(recs))
+                             if recs[j]["blocks"] == r["blocks"] and recs[j]["length"] == r["length"]), None)
+        later = set(b for x in recs[i + 1:] if x["blocks"] != r["blocks"] for b in x["blocks"])
+        r["overwritten"] = len(set(r["blocks"]) & later)
+    return recs
+
+
 def current_loop(lp: Looper):
     return scan_index(lp)[0]
 
@@ -395,8 +415,44 @@ def cmd_info(lp, args):
           f"(first {loop['blocks'][0]}), index record #{loop['seq']:#x} at +{loop['offset']:#x}")
 
 
+def cmd_list(lp, args):
+    recs = all_records(lp)
+    if not recs:
+        print("no loops in the index")
+        return
+    print(" #  length   blocks  first  note")
+    for i, r in enumerate(recs):
+        secs = r["length"] / SAMPLE_WIDTH / SAMPLE_RATE
+        if i == len(recs) - 1:
+            note = "CURRENT (the loop the pedal plays)"
+        elif r["same_as"] is not None:
+            note = f"same audio as #{r['same_as']}"
+        elif r["overwritten"]:
+            note = f"{r['overwritten']}/{len(r['blocks'])} blocks reused later (partly overwritten)"
+        else:
+            note = "old loop, probably intact"
+        print(f"{i:2d}  {secs:6.2f}s  {len(r['blocks']):6d}  {r['blocks'][0]:5d}  {note}")
+
+
 def cmd_download(lp, args):
-    loop = current_loop(lp)
+    if args.all:
+        import os
+        os.makedirs(args.file, exist_ok=True)
+        recs = all_records(lp)
+        for i, r in enumerate(recs):
+            if r["same_as"] is not None:
+                continue
+            path = os.path.join(args.file, f"loop{i:02d}{'-current' if i == len(recs) - 1 else ''}.wav")
+            print(f"#{i}: {r['length'] / SAMPLE_WIDTH / SAMPLE_RATE:.2f} s -> {path}", file=sys.stderr)
+            write_wav(path, read_loop_pcm(lp, r))
+        return
+    if args.record is not None:
+        recs = all_records(lp)
+        if not 0 <= args.record < len(recs):
+            raise DeviceError(f"no record #{args.record} (see 'list')")
+        loop = recs[args.record]
+    else:
+        loop = current_loop(lp)
     if not loop:
         raise DeviceError("no loop stored on the pedal")
     secs = loop["length"] / SAMPLE_WIDTH / SAMPLE_RATE
@@ -445,8 +501,13 @@ def main():
 
     sub.add_parser("info", help="show device and stored loop info").set_defaults(func=cmd_info)
 
+    sub.add_parser("list", help="list the current loop and older loops still in the index") \
+        .set_defaults(func=cmd_list)
+
     p = sub.add_parser("download", help="save the loop stored on the pedal as a WAV file")
-    p.add_argument("file")
+    p.add_argument("file", help="output WAV (or output directory with --all)")
+    p.add_argument("-r", "--record", type=int, help="download an older loop (number from 'list')")
+    p.add_argument("-a", "--all", action="store_true", help="download every loop in the index into directory FILE")
     p.set_defaults(func=cmd_download)
 
     p = sub.add_parser("upload", help="replace the loop on the pedal with an audio file (wav/mp3/flac/...)")
