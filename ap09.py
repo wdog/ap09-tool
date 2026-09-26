@@ -23,7 +23,7 @@ CMD_INFO = 0x11
 CMD_ERASE = 0x21
 CMD_WRITE = 0x22
 CMD_READ = 0x23
-CMD_24 = 0x24  # purpose unknown (9-byte body: area, addr LE32, LE32)
+CMD_24 = 0x24  # checksum: body area, addr LE32, len LE32 -> echo + u16 sum of the bytes
 
 AREA_MCU = 0   # MCU internal flash (firmware + settings) - never write here
 AREA_NAND = 1  # 256 MiB NAND holding the audio and the loop index
@@ -158,6 +158,20 @@ class Looper:
         rcmd, rbody = self.transact(cmd, body, timeout)
         if rcmd != 0x00 or rbody != b"\x00":
             raise DeviceError(f"cmd 0x{cmd:02x} failed (reply cmd 0x{rcmd:02x}, status {rbody.hex(' ')})")
+
+    def checksum(self, area: int, addr: int, length: int) -> int:
+        """16-bit sum of `length` bytes computed on the device (cmd 0x24)."""
+        body = bytes([area]) + addr.to_bytes(4, "little") + length.to_bytes(4, "little")
+        r = self.command(CMD_24, body, timeout=30000)
+        if r[:9] != body:
+            raise DeviceError("checksum reply does not echo the request")
+        return int.from_bytes(r[9:11], "little")
+
+    def block_is_erased(self, blk: int) -> bool:
+        a = blk * BLOCK_SIZE
+        n = BLOCK_SIZE - 1  # odd length so an all-FF block (0xff01) can't be confused with all-00
+        return self.checksum(AREA_NAND, a, n) == (0xFF * n) & 0xFFFF and \
+            self.read(AREA_NAND, a, 16) == b"\xff" * 16
 
     def erase_block(self, area: int, addr: int):
         self.status_command(CMD_ERASE, bytes([area]) + addr.to_bytes(4, "little"), timeout=30000)
@@ -342,54 +356,74 @@ def upload_loop(lp: Looper, pcm: bytes, progress=True):
 
     _, last_off, used = scan_index(lp)
 
-    # Same strategy as the official tool (0x406ca0): start at a random block and
-    # take free blocks upwards, wrapping around. Blocks referenced by any record
-    # still in the index log are treated as used.
+    # Find the index slot first, so we fail before writing any audio.
+    slot = find_record_slot(lp, last_off)
+
+    # Same order as the official tool (0x406ca0): start at a random block, go up,
+    # wrap around, skip blocks referenced by any record still in the index log.
     start = random.randrange(INDEX_BLOCK)
     order = list(range(start, INDEX_BLOCK)) + list(range(0, start))
     candidates = [b for b in order if b not in used]
 
     blocks = []
-    done = 0
-    total_pages = -(-len(pcm) // PAGE_AUDIO)
     pos = 0
+    checked = 0
     while pos < len(pcm):
         if not candidates:
-            raise DeviceError("no free NAND blocks left")
+            raise DeviceError("not enough erased NAND blocks for this audio")
         blk = candidates.pop(0)
-        try:
-            lp.erase_block(AREA_NAND, blk * BLOCK_SIZE)
-        except DeviceError as e:
-            print(f"\n  block {blk}: erase failed ({e}), skipping", file=sys.stderr)
+        addr = blk * BLOCK_SIZE
+        checked += 1
+        # The erase command answers OK but does nothing on this firmware, so only
+        # blocks that are already erased (all FF) can be programmed cleanly.
+        lp.erase_block(AREA_NAND, addr)
+        if not lp.block_is_erased(blk):
             continue
         bi = len(blocks)
-        block_start = pos
+        image = bytearray(b"\xff" * BLOCK_SIZE)
+        block_pcm = pcm[pos:pos + per_block]
         try:
-            for chunk in range(PAGES_PER_BLOCK):
-                if pos >= len(pcm):
-                    break
-                data = pcm[pos:pos + PAGE_AUDIO]
-                lp.write(AREA_NAND, blk * BLOCK_SIZE + page_for_chunk(bi, chunk) * PAGE_SIZE, data)
-                pos += len(data)
-                done += 1
-                if progress and done % 32 == 0:
-                    print(f"\r  {100 * done // total_pages}%", end="", file=sys.stderr, flush=True)
+            for chunk in range(-(-len(block_pcm) // PAGE_AUDIO)):
+                data = block_pcm[chunk * PAGE_AUDIO:(chunk + 1) * PAGE_AUDIO]
+                page = page_for_chunk(bi, chunk)
+                lp.write(AREA_NAND, addr + page * PAGE_SIZE, data)
+                image[page * PAGE_SIZE:page * PAGE_SIZE + len(data)] = data
+            ok = lp.checksum(AREA_NAND, addr, BLOCK_SIZE) == sum(image) & 0xFFFF
         except DeviceError as e:
-            print(f"\n  block {blk}: write failed ({e}), retrying on another block", file=sys.stderr)
-            done -= -(-(pos - block_start) // PAGE_AUDIO)
-            pos = block_start
+            print(f"\n  block {blk}: {e}", file=sys.stderr)
+            ok = False
+        if not ok:
+            print(f"\n  block {blk}: verify failed, using another block", file=sys.stderr)
+            used.add(blk)
             continue
         blocks.append(blk)
+        pos += len(block_pcm)
+        if progress:
+            print(f"\r  {100 * pos // len(pcm)}%  (block {len(blocks)}/{nblocks}, "
+                  f"{checked - len(blocks)} non-empty skipped)", end="", file=sys.stderr, flush=True)
     if progress:
-        print("\r  100%", file=sys.stderr)
+        print(file=sys.stderr)
 
-    # Append the new record to the index log; erase the log block when full (0x407cfa).
-    slot = 0 if last_off is None else last_off // PAGE_SIZE + 2
-    if slot >= PAGES_PER_BLOCK:
-        lp.erase_block(AREA_NAND, INDEX_BLOCK * BLOCK_SIZE)
-        slot = 0
-    lp.write(AREA_NAND, INDEX_BLOCK * BLOCK_SIZE + slot * PAGE_SIZE, build_record(len(pcm), blocks))
+    rec = build_record(len(pcm), blocks)
+    lp.write(AREA_NAND, INDEX_BLOCK * BLOCK_SIZE + slot * PAGE_SIZE, rec)
+    if lp.read(AREA_NAND, INDEX_BLOCK * BLOCK_SIZE + slot * PAGE_SIZE, 0x60) != rec[:0x60]:
+        raise DeviceError("index record did not read back correctly")
     return blocks
+
+
+def find_record_slot(lp: Looper, last_off):
+    """Next erased 2-page slot after the newest record in the index block."""
+    first = 0 if last_off is None else last_off // PAGE_SIZE + 2
+    base = INDEX_BLOCK * BLOCK_SIZE
+    for slot in range(first, PAGES_PER_BLOCK - 1, 2):
+        a = base + slot * PAGE_SIZE
+        if lp.checksum(AREA_NAND, a, RECORD_SIZE) == (0xFF * RECORD_SIZE) & 0xFFFF and \
+                lp.read(AREA_NAND, a, 16) == b"\xff" * 16:
+            return slot
+    # The official tool erases the index block here (0x407cfa), but erase does
+    # nothing on this firmware. Recording a loop on the pedal makes it rotate
+    # its own index, which frees slots again.
+    raise DeviceError("loop index block is full; record any loop on the pedal once, then retry")
 
 
 def write_wav(path: str, pcm: bytes, rate=SAMPLE_RATE):
@@ -462,11 +496,6 @@ def cmd_download(lp, args):
 
 
 def cmd_upload(lp, args):
-    if not args.experimental:
-        raise DeviceError(
-            "upload is not working yet: the erase command (0x21) replies OK but does not erase "
-            "NAND blocks, so new audio gets ANDed with old data. See README 'Upload status'. "
-            "Pass --experimental to run it anyway.")
     model =int.from_bytes(lp.read(AREA_MCU, 0x2180, 16)[4:8], "little")
     if model != 0x2715 and not args.force:
         raise DeviceError(f"model id 0x{model:04x} is not a NANO LOOPER (0x2715); refusing to write (--force)")
@@ -474,11 +503,24 @@ def cmd_upload(lp, args):
     secs = len(pcm) / SAMPLE_WIDTH / SAMPLE_RATE
     print(f"uploading {args.file} ({secs:.2f} s); this replaces the loop on the pedal", file=sys.stderr)
     blocks = upload_loop(lp, pcm)
-    loop = current_loop(lp)
-    if not loop or loop["blocks"] != blocks:
-        raise DeviceError("index record did not read back correctly")
     print(f"done: {len(blocks)} blocks written. Unplug/replug the pedal so it reloads the loop.",
           file=sys.stderr)
+
+
+def cmd_select(lp, args):
+    recs = all_records(lp)
+    if not 0 <= args.record < len(recs):
+        raise DeviceError(f"no record #{args.record} (see 'list')")
+    r = recs[args.record]
+    if r["overwritten"]:
+        print(f"warning: {r['overwritten']} blocks of loop #{args.record} were reused later; "
+              "it will play partly corrupted", file=sys.stderr)
+    _, last_off, _ = scan_index(lp)
+    slot = find_record_slot(lp, last_off)
+    rec = build_record(r["length"], r["blocks"])
+    lp.write(AREA_NAND, INDEX_BLOCK * BLOCK_SIZE + slot * PAGE_SIZE, rec)
+    print(f"loop #{args.record} ({r['length'] / SAMPLE_WIDTH / SAMPLE_RATE:.2f} s) is now current. "
+          "Unplug/replug the pedal so it reloads the loop.", file=sys.stderr)
 
 
 def cmd_probe(lp, args):
@@ -513,8 +555,11 @@ def main():
     p = sub.add_parser("upload", help="replace the loop on the pedal with an audio file (wav/mp3/flac/...)")
     p.add_argument("file")
     p.add_argument("--force", action="store_true", help="write even if the model id is not NANO LOOPER")
-    p.add_argument("--experimental", action="store_true", help="run the (currently broken) upload anyway")
     p.set_defaults(func=cmd_upload)
+
+    p = sub.add_parser("select", help="make an older loop from 'list' the current one again")
+    p.add_argument("record", type=int)
+    p.set_defaults(func=cmd_select)
 
     p = sub.add_parser("dump", help="(debug) read raw memory")
     p.add_argument("area", help="0 = MCU flash, 1 = NAND")
