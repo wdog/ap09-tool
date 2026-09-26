@@ -21,7 +21,11 @@ Versions: tag `v0.1-download` = download only. Branch `upload` = download + uplo
 python3 ap09_gui.py
 ```
 
-![GUI](docs/gui.png)
+| Main window | Loops (with deleted shown) |
+|---|---|
+| ![main](docs/gui-main.png) | ![loops](docs/gui-loops.png) |
+| **Upload preview** | **About** |
+| ![upload](docs/gui-upload.png) | ![about](docs/gui-about.png) |
 
 Requirements (Debian/Ubuntu), in addition to `python3-usb` and `ffmpeg` from the CLI
 section:
@@ -483,8 +487,8 @@ the loop**. That one is rotated by one page: chunk 0 → page 63, chunk k → pa
 - `ap09_gui.py` — GTK4/libadwaita app built on `ap09.py`.
 - `ap09-gui.desktop` — launcher template (`@DIR@` = project folder).
 - `ruff.toml` — lint config: `ruff check .` (ruff via `pipx install ruff`).
-- `PROTOCOL.md` — early notes, now **superseded by this README**.
-- `backup-original-loop.wav` — backup of the loop that was on the pedal.
+
+- `backup-original-loop.wav` (not in git) — local backup of the loop that was on the pedal.
 - `re/` (not in git) — `Looper Software.exe` from the official installer and its `objdump -d` output (`looper_disasm.txt`).
 
 ---

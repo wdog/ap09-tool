@@ -152,6 +152,74 @@ class Waveform(Gtk.DrawingArea):
             cr.stroke()
 
 
+class Alert:
+    """Drop-in for the Adw.AlertDialog calls used here, with explicit padding: some GTK themes
+    strip the stock dialog margins, which made dialogs look cramped."""
+
+    def __init__(self, heading="", body=""):
+        self.heading, self.body = heading, body
+        self.extra = None
+        self.responses = []          # (id, label)
+        self.appearance = {}
+        self.default = None
+        self.callbacks = []
+        self.dialog = None
+
+    def set_extra_child(self, w):
+        self.extra = w
+
+    def add_response(self, rid, label):
+        self.responses.append((rid, label))
+
+    def set_response_appearance(self, rid, appearance):
+        self.appearance[rid] = appearance
+
+    def set_default_response(self, rid):
+        self.default = rid
+
+    def connect(self, signal, cb):
+        assert signal == "response"
+        self.callbacks.append(cb)
+
+    def _respond(self, rid):
+        self.dialog.close()
+        for cb in self.callbacks:
+            cb(self, rid)
+
+    def present(self, parent):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14,
+                      margin_top=28, margin_bottom=24, margin_start=28, margin_end=28)
+        title = Gtk.Label(label=self.heading, wrap=True, justify=Gtk.Justification.CENTER)
+        title.add_css_class("title-2")
+        box.append(title)
+        if self.body:
+            body = Gtk.Label(label=self.body, wrap=True, justify=Gtk.Justification.CENTER, max_width_chars=48)
+            box.append(body)
+        if self.extra:
+            box.append(self.extra)
+        buttons = Gtk.Box(spacing=12, homogeneous=True, margin_top=10)
+        for rid, label in self.responses:
+            btn = Gtk.Button(label=label)
+            btn.add_css_class("pill")
+            app = self.appearance.get(rid)
+            if app == Adw.ResponseAppearance.SUGGESTED:
+                btn.add_css_class("suggested-action")
+            elif app == Adw.ResponseAppearance.DESTRUCTIVE:
+                btn.add_css_class("destructive-action")
+            btn.connect("clicked", lambda *_, r=rid: self._respond(r))
+            buttons.append(btn)
+            if rid == self.default:
+                self._default_btn = btn
+        box.append(buttons)
+        self.dialog = Adw.Dialog(child=box, content_width=460)
+        cancel = next((r for r, _ in self.responses if r in ("cancel", "ok")), None)
+        if cancel:
+            self.dialog.connect("closed", lambda *_: None)
+        self.dialog.present(parent)
+        if getattr(self, "_default_btn", None):
+            self._default_btn.grab_focus()
+
+
 def badge(text: str, kind: str) -> Gtk.Label:
     lbl = Gtk.Label(label=text)
     lbl.add_css_class("pill-badge")
@@ -598,7 +666,9 @@ class LooperWindow(Adw.ApplicationWindow):
             self.hero_time.add_css_class("state-empty")
             self.hero_sub.set_label("Record one on the pedal, upload a file, or restore one below")
             self.hero_wave.set_peaks(None, "")
+            self.hero_wave.set_visible(False)
             return
+        self.hero_wave.set_visible(True)
         self.hero_time.remove_css_class("state-empty")
         self.hero_time.add_css_class("state-playing")
         self.hero_time.set_label(fmt_secs(loop_secs(cur)))
@@ -827,16 +897,21 @@ class LooperWindow(Adw.ApplicationWindow):
         self._end_progress()
         secs = len(pcm) / ap09.SAMPLE_WIDTH / ap09.SAMPLE_RATE
         blocks = -(-len(pcm) // (ap09.PAGE_AUDIO * ap09.PAGES_PER_BLOCK))
-        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        wave = Waveform(height=80)
-        wave.set_size_request(420, -1)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_top=6)
+        frame = Gtk.Box(margin_top=12, margin_bottom=12, margin_start=14, margin_end=14)
+        wave = Waveform(height=72)
+        wave.set_size_request(380, -1)
         wave.set_peaks(peaks(pcm))
-        body.append(wave)
+        frame.append(wave)
+        card = Gtk.Box()
+        card.add_css_class("card")
+        card.append(frame)
+        body.append(card)
         space = ""
         if self.space:
             free = self.space[0]
             space = f"\nFree memory: {free} blocks" + ("  ⚠ not enough!" if free < blocks else "")
-        dlg = Adw.AlertDialog(
+        dlg = Alert(
             heading="Put this on the pedal?",
             body=f"{os.path.basename(path)}\n{fmt_secs(secs)} · {blocks} memory blocks{space}\n\n"
                  "It replaces the loop the pedal plays. The current loop stays in memory "
@@ -883,7 +958,7 @@ class LooperWindow(Adw.ApplicationWindow):
         warn = ""
         if r["overwritten"]:
             warn = f"\n\n⚠ {r['overwritten']} of its {len(r['blocks'])} blocks were reused: it will sound damaged."
-        dlg = Adw.AlertDialog(heading=f"Put #{i} on the pedal?",
+        dlg = Alert(heading=f"Put #{i} on the pedal?",
                               body=f"{fmt_secs(loop_secs(r))}. It replaces the current loop "
                                    f"(which stays in memory).{warn}")
         dlg.add_response("cancel", "Cancel")
@@ -894,7 +969,7 @@ class LooperWindow(Adw.ApplicationWindow):
         dlg.present(self)
 
     def confirm_delete(self, i, r):
-        dlg = Adw.AlertDialog(heading=f"Delete #{i}?",
+        dlg = Alert(heading=f"Delete #{i}?",
                               body=f"{fmt_secs(loop_secs(r))}. It disappears from the list. The audio "
                                    "cannot be wiped over USB and is overwritten when the memory is needed.")
         dlg.add_response("cancel", "Cancel")
@@ -908,7 +983,7 @@ class LooperWindow(Adw.ApplicationWindow):
         if not any(r["current"] for r in self.records):
             self.toast("The pedal already has no loop")
             return
-        dlg = Adw.AlertDialog(heading="Clear the pedal?",
+        dlg = Alert(heading="Clear the pedal?",
                               body="The pedal will have no loop and the loop disappears from the list. "
                                    "Its audio stays in memory until it is needed again.")
         dlg.add_response("cancel", "Cancel")
@@ -989,12 +1064,12 @@ class LooperWindow(Adw.ApplicationWindow):
             self.toast("Stopped. Nothing on the pedal changed.")
             self.refresh()
             return
-        dlg = Adw.AlertDialog(heading="Something went wrong", body=msg)
+        dlg = Alert(heading="Something went wrong", body=msg)
         dlg.add_response("ok", "OK")
         dlg.present(self)
 
     def done_dialog(self, heading, body):
-        dlg = Adw.AlertDialog(heading=heading, body=body)
+        dlg = Alert(heading=heading, body=body)
         dlg.add_response("ok", "OK")
         dlg.present(self)
 
