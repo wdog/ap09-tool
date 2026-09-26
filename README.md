@@ -98,6 +98,28 @@ To produce the exact format yourself:
 ffmpeg -i song.mp3 -ac 1 -ar 46875 -c:a pcm_s24le song-ap09.wav
 ```
 
+### Remove the loop
+
+```
+python3 ap09.py clear          # asks for confirmation; -y to skip it
+```
+
+The pedal ends up with no loop. The audio cannot be wiped over USB. Until the next
+restart the old loop stays in `list` as history and `select` can bring it back. At
+power-on the pedal rewrites its index and the history disappears.
+
+### What `list` shows
+
+```
+Pedal: ▶ plays loop #3 (19.91 s)
+
+ #   length  status
+ 0   13.93s  💾 previous loop, audio still in memory → 'select 0' to play it again
+ 1    7.94s  ⚠ previous loop, damaged: 3 of 9 memory blocks reused by a later loop
+ 2   19.91s  ↺ duplicate of #3 (same audio)
+ 3   19.91s  ▶ current loop, the one the pedal plays
+```
+
 ### Bring back an older loop
 
 ```
@@ -172,7 +194,11 @@ The official tool erases blocks and then writes them. On this pedal **the erase 
 - Capacity = number of empty blocks. Measured on this unit: of the first 1024 blocks
   about 200 had an FF first page. In a test upload, 8 of 14 candidates were already
   used.
-- The index block cannot be erased. It has 32 record slots (the unit had 15 used, then
+- **Observed at power-on (once, after a `clear`):** the pedal erases the index
+  block itself and writes a single record with the current state. So its internal
+  erase works, the history in `list` disappears after every replug, and the index slots
+  become free again. The old audio blocks stay untouched.
+- The index block cannot be erased over USB. It has 32 record slots (the unit had 15 used, then
   17). When it is full, upload/select stop with "loop index block is full; record any loop
   on the pedal once". Assumption (untested): the pedal erases or rotates its own index
   when it needs to.

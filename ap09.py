@@ -507,23 +507,33 @@ def cmd_info(lp, args):
 
 def cmd_list(lp, args):
     recs = all_records(lp)
+    current = next((i for i, r in enumerate(recs) if r["current"]), None)
+    if current is not None:
+        secs = recs[current]["length"] / SAMPLE_WIDTH / SAMPLE_RATE
+        print(f"Pedal: ▶ plays loop #{current} ({secs:.2f} s)")
+    else:
+        print("Pedal: ⏹ no loop (empty or cleared)")
     if not recs:
-        print("no loops in the index")
         return
-    if not any(r["current"] for r in recs):
-        print("(the newest record clears the loop: the pedal currently has no loop)")
-    print(" #  length   blocks  first  note")
+    print()
+    print(" #   length  status")
     for i, r in enumerate(recs):
         secs = r["length"] / SAMPLE_WIDTH / SAMPLE_RATE
         if r["current"]:
-            note = "CURRENT (the loop the pedal plays)"
+            status = "▶ current loop, the one the pedal plays"
         elif r["same_as"] is not None:
-            note = f"same audio as #{r['same_as']}"
+            status = f"↺ duplicate of #{r['same_as']} (same audio)"
         elif r["overwritten"]:
-            note = f"{r['overwritten']}/{len(r['blocks'])} blocks reused later (partly overwritten)"
+            status = (f"⚠ previous loop, damaged: {r['overwritten']} of {len(r['blocks'])} "
+                      "memory blocks reused by a later loop")
         else:
-            note = "old loop, probably intact"
-        print(f"{i:2d}  {secs:6.2f}s  {len(r['blocks']):6d}  {r['blocks'][0]:5d}  {note}")
+            status = f"💾 previous loop, audio still in memory → 'select {i}' to play it again"
+        print(f"{i:2d}  {secs:6.2f}s  {status}")
+    if len(recs) > 1 or current is None:
+        print()
+        print("Previous loops are history only: the pedal forgets them when it restarts\n"
+              "(it rewrites its index at power-on); their audio is overwritten only when\n"
+              "the memory is needed again. 'download -r N' saves one, 'select N' restores it.")
 
 
 def cmd_download(lp, args):
@@ -742,9 +752,10 @@ After select unplug and replug the pedal.""")
 Remove the current loop, like clearing it on the pedal: a 'no loop' record is
 added to the index. Asks for confirmation unless -y is given.
 
-limits: the audio itself cannot be wiped (the pedal's erase command does not
-work over USB), so older loops stay visible in 'list' and can be brought back
-with 'select'. Uses one index slot.
+limits: the audio itself cannot be wiped over USB (the erase command is ignored).
+Until the pedal restarts, older loops stay in 'list' as history and can be
+brought back with 'select'; at power-on the pedal rewrites its index and the
+history disappears (the audio stays in memory until it gets reused).
 
 After clear unplug and replug the pedal.""")
     p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
