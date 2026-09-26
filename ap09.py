@@ -793,7 +793,6 @@ the one marked CURRENT; the older ones usually still have their audio in memory
 and can be downloaded (download -r N) or made current again (select N).
 
 notes:
-  same audio as #N      duplicate record pointing to the same audio
   partly overwritten    some of its memory blocks were reused by a later loop
 Read-only.""")
     p.set_defaults(func=cmd_list)
