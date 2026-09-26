@@ -13,6 +13,7 @@ __license__ = "MIT"
 __version__ = "0.3"
 
 import argparse
+import os
 import struct
 import sys
 import wave
@@ -347,7 +348,8 @@ def all_records(lp: Looper, include_deleted=False):
                 deleted.add(target)
             current = None
     recs = sorted(loops.values(), key=lambda r: r["first"])
-    for r in recs:
+    for num, r in enumerate(recs):
+        r["num"] = num  # stable loop number, the same with or without deleted loops shown
         k = (r["length"], tuple(r["blocks"]))
         r["current"] = k == current
         r["deleted"] = k in deleted
@@ -569,156 +571,6 @@ def write_wav(path: str, pcm: bytes, rate=SAMPLE_RATE):
         w.writeframes(pcm[:len(pcm) - len(pcm) % SAMPLE_WIDTH])
 
 
-# ---------------------------------------------------------------- CLI
-
-def cmd_info(lp, args):
-    info = lp.info()
-    model = int.from_bytes(lp.read(AREA_MCU, 0x2180, 16)[4:8], "little")
-    loop = current_loop(lp)
-    ok = model == 0x2715
-    rows = [
-        ("device", f"{VID:04x}:{PID:04x}  bus {lp.dev.bus} addr {lp.dev.address}", None),
-        ("model", f"0x{model:04x} " + ("NANO LOOPER" if ok else "unknown"), "32" if ok else "31"),
-        ("info", info[:16].decode("ascii", "replace") + " " + info[16:].hex(" "), "2"),
-        ("format", f"mono  24-bit  {SAMPLE_RATE} Hz", None),
-    ]
-    if loop:
-        secs = loop["length"] / SAMPLE_WIDTH / SAMPLE_RATE
-        rows += [
-            ("loop", f"▶ {secs:.2f} s", "1;32"),
-            ("size", f"{loop['length']} B  {len(loop['blocks'])} blocks  first {loop['blocks'][0]}", None),
-            ("index", f"record @ +{loop['offset']:#x}  seq {loop['seq']:#x}", "2"),
-        ]
-    else:
-        rows.append(("loop", "■ none", "1;31"))
-    for key, val, color in rows:
-        print(f"{_color('1', f'{key:<7}')} {_color(color, val) if color else val}")
-
-
-def _color(code: str, text: str) -> str:
-    import os
-    if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
-        return text
-    return f"\033[{code}m{text}\033[0m"
-
-
-STATES = {  # key: (icon, label, ANSI color, legend)
-    "playing": ("▶", "playing", "1;32", "loop the pedal plays now"),
-    "saved": ("●", "saved", "36", "old loop, not playing, audio still in memory -> select N / download -r N"),
-    "damaged": ("⚠", "damaged", "33", "old loop, N/M blocks overwritten by a later one"),
-    "dup": ("↺", "duplicate", "2", "same audio as another entry"),
-    "deleted": ("✖", "deleted", "2", "removed with clear/delete; audio may still be in memory -> select N"),
-}
-
-
-def cmd_list(lp, args):
-    recs = all_records(lp, include_deleted=args.all)
-    current = next((i for i, r in enumerate(recs) if r["current"]), None)
-    if current is None:
-        print(_color("1;31", "■ no loop"))
-    else:
-        secs = recs[current]["length"] / SAMPLE_WIDTH / SAMPLE_RATE
-        print(_color("1;32", f"▶ playing #{current}  {secs:.2f} s"))
-    if not recs:
-        return
-    print()
-    print(_color("1", " #    length  blocks  state"))
-    seen = []
-    for i, r in enumerate(recs):
-        secs = r["length"] / SAMPLE_WIDTH / SAMPLE_RATE
-        if r["current"]:
-            key, extra = "playing", ""
-        elif r["deleted"]:
-            key, extra = "deleted", ""
-        elif r["same_as"] is not None:
-            key, extra = "dup", f" of #{r['same_as']}"
-        elif r["overwritten"]:
-            key, extra = "damaged", f" {r['overwritten']}/{len(r['blocks'])}"
-        else:
-            key, extra = "saved", ""
-        icon, label, color, _ = STATES[key]
-        print(f"{i:2d}  {secs:7.2f}s  {len(r['blocks']):6d}  " + _color(color, f"{icon} {label}{extra}"))
-        if key not in seen:
-            seen.append(key)
-    print()
-    for key in seen:
-        icon, label, color, legend = STATES[key]
-        print(_color("2", f"{icon} {label:<9} {legend}"))
-    if "saved" in seen:
-        print(_color("2", "  history stays until the pedal compacts its index (seen when the log was half full)"))
-
-
-def cmd_download(lp, args):
-    if args.all:
-        import os
-        os.makedirs(args.file, exist_ok=True)
-        recs = all_records(lp)
-        for i, r in enumerate(recs):
-            if r["same_as"] is not None:
-                continue
-            path = os.path.join(args.file, f"loop{i:02d}{'-current' if r['current'] else ''}.wav")
-            print(f"#{i}: {r['length'] / SAMPLE_WIDTH / SAMPLE_RATE:.2f} s -> {path}", file=sys.stderr)
-            write_wav(path, read_loop_pcm(lp, r))
-        return
-    if args.record is not None:
-        recs = all_records(lp)
-        if not 0 <= args.record < len(recs):
-            raise DeviceError(f"no record #{args.record} (see 'list')")
-        loop = recs[args.record]
-    else:
-        loop = current_loop(lp)
-    if not loop:
-        raise DeviceError("no loop stored on the pedal")
-    secs = loop["length"] / SAMPLE_WIDTH / SAMPLE_RATE
-    print(f"downloading {secs:.2f} s loop -> {args.file}", file=sys.stderr)
-    write_wav(args.file, read_loop_pcm(lp, loop))
-    print(f"saved {args.file} (mono, 24-bit, {SAMPLE_RATE} Hz)", file=sys.stderr)
-
-
-def cmd_upload(lp, args):
-    model = int.from_bytes(lp.read(AREA_MCU, 0x2180, 16)[4:8], "little")
-    if model != 0x2715 and not args.force:
-        raise DeviceError(f"model id 0x{model:04x} is not a NANO LOOPER (0x2715); refusing to write (--force)")
-    pcm = load_audio(args.file)
-    secs = len(pcm) / SAMPLE_WIDTH / SAMPLE_RATE
-    print(f"uploading {args.file} ({secs:.2f} s); this replaces the loop on the pedal", file=sys.stderr)
-    blocks = upload_loop(lp, pcm)
-    print(f"done: {len(blocks)} blocks written. Unplug/replug the pedal so it reloads the loop.",
-          file=sys.stderr)
-
-
-def cmd_delete(lp, args):
-    recs = all_records(lp)
-    if not 0 <= args.record < len(recs):
-        raise DeviceError(f"no loop #{args.record} (see 'list')")
-    r = recs[args.record]
-    if not args.yes:
-        what = "the loop the pedal plays (the pedal will have no loop)" if r["current"] else "an old loop"
-        answer = input(f"delete loop #{args.record} ({r['length'] / SAMPLE_WIDTH / SAMPLE_RATE:.2f} s), {what}? [y/N] ")
-        if answer.strip().lower() not in ("y", "yes", "s", "si", "sì"):
-            print("aborted", file=sys.stderr)
-            return
-    delete_loop(lp, r)
-    print(f"loop #{args.record} deleted from the list (numbers shift; see 'list')."
-          + (" Unplug/replug the pedal." if r["current"] else ""), file=sys.stderr)
-
-
-def cmd_select(lp, args):
-    recs = all_records(lp, include_deleted=args.all)
-    if not 0 <= args.record < len(recs):
-        raise DeviceError(f"no record #{args.record} (see 'list')")
-    r = recs[args.record]
-    if r["current"]:
-        print(f"loop #{args.record} is already the one the pedal plays; nothing written", file=sys.stderr)
-        return
-    if r["overwritten"]:
-        print(f"warning: {r['overwritten']} blocks of loop #{args.record} were reused later; "
-              "it will play partly corrupted", file=sys.stderr)
-    select_loop(lp, r)
-    print(f"loop #{args.record} ({r['length'] / SAMPLE_WIDTH / SAMPLE_RATE:.2f} s) is now current. "
-          "Unplug/replug the pedal so it reloads the loop.", file=sys.stderr)
-
-
 def append_record(lp: Looper, rec: bytes):
     """Write a record into the next empty slot of the index log and read it back."""
     _, last_off, _ = scan_index(lp)
@@ -769,22 +621,6 @@ def build_clear_record(loop=None) -> bytes:
     return bytes(rec)
 
 
-def cmd_clear(lp, args):
-    current, last_off, _ = scan_index(lp)
-    if not current and not args.yes:
-        print("the pedal already has no loop", file=sys.stderr)
-        return
-    if not args.yes:
-        secs = current["length"] / SAMPLE_WIDTH / SAMPLE_RATE
-        answer = input(f"remove the current {secs:.2f} s loop from the pedal? "
-                       "(it stays in 'list' and can come back with 'select') [y/N] ")
-        if answer.strip().lower() not in ("y", "yes", "s", "si", "sì"):
-            print("aborted", file=sys.stderr)
-            return
-    clear_loop(lp)
-    print("the pedal now has no loop. Unplug/replug the pedal so it reloads.", file=sys.stderr)
-
-
 PER_BLOCK_S = PAGE_AUDIO * PAGES_PER_BLOCK / SAMPLE_WIDTH / SAMPLE_RATE  # ~0.93 s of audio per block
 
 
@@ -805,6 +641,267 @@ def count_space(lp: Looper, progress=True):
         if lp.checksum(AREA_NAND, base + slot * PAGE_SIZE, RECORD_SIZE) == (0xFF * RECORD_SIZE) & 0xFFFF:
             slots += 1
     return free, slots
+
+
+# ---------------------------------------------------------------- shared presentation
+# Used by both the CLI and the GUI so they show the same names, icons, colours and numbers.
+
+def _color(code: str, text: str) -> str:
+    import os
+    if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+STATES = {  # key: (icon, label, ANSI colour, legend)
+    "playing": ("▶", "playing", "1;32", "the loop the pedal plays now"),
+    "memory": ("●", "in memory", "36", "old loop, not playing, audio still in memory"),
+    "damaged": ("⚠", "damaged", "33", "old loop, some memory blocks overwritten by a later loop"),
+    "deleted": ("✖", "deleted", "2", "removed with clear/delete, audio may still be in memory"),
+}
+
+
+def loop_secs(loop) -> float:
+    return loop["length"] / SAMPLE_WIDTH / SAMPLE_RATE
+
+
+def fmt_secs(secs: float) -> str:
+    m, sec = divmod(secs, 60)
+    return f"{int(m)}:{sec:05.2f}" if m else f"{sec:.2f} s"
+
+
+def loop_state(loop):
+    """(state key, label text) for a loop from all_records()."""
+    if loop["current"]:
+        return "playing", "playing"
+    if loop.get("deleted"):
+        return "deleted", "deleted"
+    if loop["overwritten"]:
+        return "damaged", f"damaged {loop['overwritten']}/{len(loop['blocks'])}"
+    return "memory", "in memory"
+
+
+def find_loop(lp: Looper, num: int):
+    """Loop by its stable number (as shown by list / the GUI), deleted ones included."""
+    for r in all_records(lp, include_deleted=True):
+        if r["num"] == num:
+            return r
+    raise DeviceError(f"no loop #{num} (see 'list --all')")
+
+
+def read_device_info(lp: Looper) -> dict:
+    info = lp.info()
+    model = int.from_bytes(lp.read(AREA_MCU, 0x2180, 16)[4:8], "little")
+    return {
+        "usb": f"{VID:04x}:{PID:04x}",
+        "bus": lp.dev.bus,
+        "address": lp.dev.address,
+        "model": model,
+        "model_name": "NANO LOOPER" if model == 0x2715 else "unknown",
+        "info": info[:16].decode("ascii", "replace") + " " + info[16:].hex(" "),
+        "format": f"mono · 24-bit · {SAMPLE_RATE} Hz",
+    }
+
+
+def cache_dir() -> str:
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "ap09")
+
+
+def cache_path(loop) -> str:
+    """Cache file for a loop's audio; the key is its length + blocks (= its audio)."""
+    import hashlib
+    key = hashlib.sha1(repr((loop["length"], list(loop["blocks"]))).encode()).hexdigest()[:16]
+    return os.path.join(cache_dir(), f"loop-{key}.wav")
+
+
+def fetch_loop_wav(lp: Looper, loop, progress=True) -> str:
+    """Return a WAV path with the loop's audio, reading it from the pedal only if not cached.
+    Shared by CLI (download/play) and GUI (preview/save)."""
+    path = cache_path(loop)
+    if not os.path.exists(path):
+        os.makedirs(cache_dir(), exist_ok=True)
+        tmp = path + ".part"
+        write_wav(tmp, read_loop_pcm(lp, loop, progress=progress))
+        os.replace(tmp, path)
+    return path
+
+
+def seed_cache(loop, pcm: bytes):
+    """Store audio we just uploaded, so it can be played/saved without reading it back."""
+    os.makedirs(cache_dir(), exist_ok=True)
+    write_wav(cache_path(loop), pcm)
+
+
+# ---------------------------------------------------------------- CLI
+
+def print_kv(rows):
+    """Aligned 'key  value' lines; rows are (key, value, ansi colour or None)."""
+    width = max(len(k) for k, _, _ in rows)
+    for key, val, color in rows:
+        print(f"{_color('1', key.ljust(width))}  {_color(color, val) if color else val}")
+
+
+def cmd_info(lp, args):
+    d = read_device_info(lp)
+    ok = d["model"] == 0x2715
+    rows = [
+        ("device", f"{d['usb']}  bus {d['bus']} addr {d['address']}", None),
+        ("model", f"0x{d['model']:04x} {d['model_name']}", "32" if ok else "31"),
+        ("format", d["format"], None),
+        ("info", d["info"], "2"),
+    ]
+    loop = current_loop(lp)
+    if loop:
+        rows += [
+            ("loop", f"▶ {fmt_secs(loop_secs(loop))}", "1;32"),
+            ("size", f"{loop['length']:,} bytes · {len(loop['blocks'])} blocks · first {loop['blocks'][0]}", None),
+            ("index", f"record @ +{loop['offset']:#x}", "2"),
+        ]
+    else:
+        rows.append(("loop", "■ no loop", "1;31"))
+    print_kv(rows)
+
+
+def cmd_list(lp, args):
+    recs = all_records(lp, include_deleted=True)
+    shown = [r for r in recs if args.all or not r["deleted"]]
+    cur = next((r for r in recs if r["current"]), None)
+    if cur:
+        print(_color("1;32", f"▶ playing #{cur['num']}  {fmt_secs(loop_secs(cur))}"))
+    else:
+        print(_color("1;31", "■ no loop"))
+    hidden = len(recs) - len(shown)
+    if not shown:
+        if hidden:
+            print(_color("2", f"{hidden} deleted loop(s) hidden, see 'list --all'"))
+        return
+    print()
+    print(_color("1", " #     length  blocks  state"))
+    seen = []
+    for r in shown:
+        key, label = loop_state(r)
+        icon, _, color, _ = STATES[key]
+        print(f"{r['num']:2d}  {fmt_secs(loop_secs(r)):>9}  {len(r['blocks']):6d}  " + _color(color, f"{icon} {label}"))
+        if key not in seen:
+            seen.append(key)
+    print()
+    for key in seen:
+        icon, label, _, legend = STATES[key]
+        print(_color("2", f"{icon} {label:<10} {legend}"))
+    print(_color("2", "  play N · download -r N · select N · delete N"
+                 + (f" · {hidden} deleted hidden: list --all" if hidden else "")))
+
+
+def _chosen_loop(lp, num):
+    if num is None:
+        loop = current_loop(lp)
+        if not loop:
+            raise DeviceError("the pedal has no loop; pick one with -r N (see 'list')")
+        return find_loop(lp, next(r["num"] for r in all_records(lp) if r["current"]))
+    return find_loop(lp, num)
+
+
+def cmd_download(lp, args):
+    import shutil
+    if args.all:
+        os.makedirs(args.file, exist_ok=True)
+        for r in all_records(lp, include_deleted=False):
+            path = os.path.join(args.file, f"ap09-loop{r['num']:02d}{'-playing' if r['current'] else ''}.wav")
+            print(f"#{r['num']}: {fmt_secs(loop_secs(r))} -> {path}", file=sys.stderr)
+            shutil.copyfile(fetch_loop_wav(lp, r), path)
+        return
+    loop = _chosen_loop(lp, args.record)
+    print(f"#{loop['num']}: {fmt_secs(loop_secs(loop))} -> {args.file}", file=sys.stderr)
+    shutil.copyfile(fetch_loop_wav(lp, loop), args.file)
+    print(f"saved {args.file} (mono, 24-bit, {SAMPLE_RATE} Hz)", file=sys.stderr)
+
+
+def cmd_play(lp, args):
+    import shutil
+    import subprocess
+    loop = _chosen_loop(lp, args.record)
+    path = fetch_loop_wav(lp, loop)
+    lp.close()  # free the pedal while listening
+    player = next((p for p in (["pw-play"], ["paplay"], ["aplay", "-q"]) if shutil.which(p[0])), None)
+    if not player:
+        raise DeviceError("no audio player found (pw-play, paplay or aplay)")
+    print(f"▶ #{loop['num']}  {fmt_secs(loop_secs(loop))}  (Ctrl-C to stop)", file=sys.stderr)
+    try:
+        subprocess.run(player + [path], check=False)
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_about(lp, args):
+    print_kv([
+        ("app", f"ap09 {__version__} · CLI + GUI (ap09_gui.py)", "1"),
+        ("author", __author__, None),
+        ("license", "MIT · keep the copyright notice in copies and derivatives", None),
+        ("device", "Ammoon AP-09 nano looper (Rowin, USB 0416:5555)", None),
+        ("cache", cache_dir(), "2"),
+    ])
+
+
+def cmd_upload(lp, args):
+    model = int.from_bytes(lp.read(AREA_MCU, 0x2180, 16)[4:8], "little")
+    if model != 0x2715 and not args.force:
+        raise DeviceError(f"model id 0x{model:04x} is not a NANO LOOPER (0x2715); refusing to write (--force)")
+    pcm = load_audio(args.file)
+    print(f"uploading {args.file} ({fmt_secs(len(pcm) / SAMPLE_WIDTH / SAMPLE_RATE)}); "
+          "it becomes the loop the pedal plays", file=sys.stderr)
+    blocks = upload_loop(lp, pcm)
+    padded = pcm[:len(pcm) - len(pcm) % SAMPLE_WIDTH]
+    padded += bytes(-len(padded) % TAIL_UNIT)
+    seed_cache({"length": len(padded), "blocks": blocks}, padded)
+    print(f"done: {len(blocks)} blocks written. Unplug/replug the pedal so it reloads the loop.", file=sys.stderr)
+
+
+def _confirm(question: str, yes: bool) -> bool:
+    if yes:
+        return True
+    answer = input(f"{question} [y/N] ")
+    if answer.strip().lower() in ("y", "yes", "s", "si", "sì"):
+        return True
+    print("aborted", file=sys.stderr)
+    return False
+
+
+def cmd_select(lp, args):
+    r = find_loop(lp, args.record)
+    if r["current"]:
+        print(f"#{r['num']} is already the loop the pedal plays; nothing written", file=sys.stderr)
+        return
+    if r["overwritten"]:
+        print(f"warning: {r['overwritten']}/{len(r['blocks'])} blocks of #{r['num']} were reused; "
+              "it will sound damaged", file=sys.stderr)
+    select_loop(lp, r)
+    print(f"#{r['num']} ({fmt_secs(loop_secs(r))}) is now playing. Unplug/replug the pedal to load it.",
+          file=sys.stderr)
+
+
+def cmd_delete(lp, args):
+    r = find_loop(lp, args.record)
+    if r["deleted"]:
+        print(f"#{r['num']} is already deleted", file=sys.stderr)
+        return
+    what = "the loop the pedal plays (the pedal will have no loop)" if r["current"] else "an old loop"
+    if not _confirm(f"delete #{r['num']} ({fmt_secs(loop_secs(r))}), {what}?", args.yes):
+        return
+    delete_loop(lp, r)
+    print(f"#{r['num']} deleted." + (" Unplug/replug the pedal." if r["current"] else ""), file=sys.stderr)
+
+
+
+def cmd_clear(lp, args):
+    current = next((r for r in all_records(lp) if r["current"]), None)
+    if not current:
+        print("the pedal already has no loop", file=sys.stderr)
+        return
+    if not _confirm(f"remove #{current['num']} ({fmt_secs(loop_secs(current))}) from the pedal?", args.yes):
+        return
+    clear_loop(lp)
+    print(f"#{current['num']} deleted; the pedal has no loop. Unplug/replug the pedal.", file=sys.stderr)
 
 
 def cmd_space(lp, args):
@@ -852,6 +949,7 @@ typical use:
 After upload / select / clear: unplug and replug the pedal so it reloads.
 Audio on the pedal: mono, 24-bit, 46875 Hz. Run 'ap09.py COMMAND -h' for details.
 Without the udev rule (see README) every command needs sudo.""")
+    ap.add_argument("-V", "--version", action="version", version=f"ap09 {__version__} · {__author__} · MIT")
     sub = ap.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
     p = sub.add_parser(
@@ -863,13 +961,13 @@ record is. Read-only.""")
     p.set_defaults(func=cmd_info)
 
     p = sub.add_parser(
-        "list", formatter_class=fmt, help="list current and older loops still in memory",
+        "list", formatter_class=fmt, help="list the loops (numbers used by play/download/select/delete)",
         description="""\
-List the loops in the pedal's index, oldest first, one line per audio (records that
-point at the same audio, e.g. after 'select', are merged). The pedal plays only the
-one marked playing; the others usually still have their audio in memory and can be
-downloaded (download -r N) or made current again (select N).
-'damaged N/M': N of its M memory blocks were reused by a later loop. Read-only.""")
+List the loops in the pedal's index, oldest first, one line per audio.
+Numbers are stable: the same in the GUI and with or without --all.
+
+states:  ▶ playing   ● in memory   ⚠ damaged N/M   ✖ deleted (only with --all)
+Read-only.""")
     p.add_argument("-a", "--all", action="store_true", help="also show deleted loops (✖)")
     p.set_defaults(func=cmd_list)
 
@@ -892,6 +990,16 @@ convert afterwards if needed:
                    help="download loop #N from 'list' instead of the current one")
     p.add_argument("-a", "--all", action="store_true", help="download every loop into directory FILE")
     p.set_defaults(func=cmd_download)
+
+    p = sub.add_parser(
+        "play", formatter_class=fmt, help="listen to a loop on this computer",
+        description="""\
+Play a loop on the computer (pw-play / paplay / aplay). The audio is read from the
+pedal the first time and cached in ~/.cache/ap09 (shared with the GUI).""")
+    p.add_argument("-r", "--record", type=int, metavar="N", help="loop #N from 'list' (default: the playing one)")
+    p.set_defaults(func=cmd_play)
+
+    sub.add_parser("about", help="author, version, license").set_defaults(func=cmd_about, no_device=True)
 
     p = sub.add_parser(
         "upload", formatter_class=fmt, help="put an audio file on the pedal as the current loop",
@@ -921,7 +1029,6 @@ partly overwritten, it will play partly corrupted. Uses one index slot.
 
 After select unplug and replug the pedal.""")
     p.add_argument("record", type=int, metavar="N", help="loop number from 'list'")
-    p.add_argument("-a", "--all", action="store_true", help="N is a number from 'list --all' (restore a deleted loop)")
     p.set_defaults(func=cmd_select)
 
     p = sub.add_parser(
@@ -987,6 +1094,9 @@ examples:
     p.set_defaults(func=cmd_probe)
 
     args = ap.parse_args()
+    if getattr(args, "no_device", False):
+        args.func(None, args)
+        return
     # check the input before touching the pedal
     if args.command == "upload":
         import os

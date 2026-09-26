@@ -65,6 +65,28 @@ Launcher for the app menu (optional):
 sed "s#@DIR@#$PWD#g" ap09-gui.desktop > ~/.local/share/applications/ap09-gui.desktop
 ```
 
+### CLI and GUI do the same things
+
+Both are built on the same functions in `ap09.py`. They share loop numbers, state
+names and icons, time format, and the audio cache (`~/.cache/ap09`). A loop read by
+one does not have to be read from the pedal again by the other.
+
+| | CLI (`ap09.py`) | GUI (`ap09_gui.py`) |
+|---|---|---|
+| device + current loop | `info` | "On the pedal" card + Device (expand) |
+| list, stable numbers `#N` | `list` | "Loops" list |
+| show deleted loops | `list --all` | "deleted" switch |
+| listen | `play [-r N]` | ▶ buttons + player bar |
+| save as WAV | `download [-r N] file`, `download -a dir` | 💾 buttons, menu "Download all" |
+| upload | `upload file` | Upload button / drag & drop |
+| make a loop play again | `select N` | "Put on pedal" |
+| delete from the list | `delete N` | 🗑 button |
+| leave the pedal empty | `clear` | ✖ on the card / menu "Clear" |
+| free space | `space` | Memory → Scan |
+| author, license | `about`, `-V` | menu → About |
+
+States: **▶ playing** · **● in memory** · **⚠ damaged N/M** · **✖ deleted**
+
 ---
 
 ## 1. How to use it
@@ -168,7 +190,7 @@ record names the loop it removes, the same way the pedal's own clear records do.
 ```
 python3 ap09.py delete 2       # asks for confirmation; -y to skip it
 python3 ap09.py list --all     # also shows deleted loops (✖)
-python3 ap09.py select --all 3 # bring a deleted loop back (number from list --all)
+python3 ap09.py select 3       # bring a deleted loop back (numbers never change)
 ```
 
 The audio cannot be wiped over USB (the erase command is ignored). It stays in memory
@@ -182,12 +204,12 @@ re-selected right after (the pedal only looks at the newest record).
 ▶ playing #3  19.91 s
 
  #    length  blocks  state
- 0    13.93s      15  ● saved
+ 0    13.93 s     15  ● in memory
  1     7.94s       9  ⚠ damaged 3/9
  3    19.91s      22  ▶ playing
 
 ▶ playing   loop the pedal plays now
-● saved     old loop, not playing, audio still in memory -> select N / download -r N
+● in memory  old loop, not playing, audio still in memory
 ⚠ damaged   old loop, N/M blocks overwritten by a later one
   history stays until the pedal compacts its index (seen when the log was half full)
 ```
@@ -199,7 +221,7 @@ Colours are used on a terminal; set `NO_COLOR=1` to turn them off.
 | icon | state | meaning |
 |---|---|---|
 | ▶ | playing | the loop the pedal plays |
-| ● | saved | older loop, audio still in memory: `download -r N` / `select N` |
+| ● | in memory | older loop, audio still in memory: `download -r N` / `select N` |
 | ⚠ | damaged | older loop, N/M blocks overwritten by a later loop |
 | ✖ | deleted | removed with `clear`/`delete` (only with `list --all`) |
 | ■ | no loop | pedal empty or cleared |

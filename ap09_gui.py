@@ -9,7 +9,6 @@ Copyright (c) 2026 wdog <wdog666@gmail.com>
 SPDX-License-Identifier: MIT  (see LICENSE; keep this notice in copies and derivatives)
 """
 
-import hashlib
 import os
 import queue
 import sys
@@ -31,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ap09  # noqa: E402
 
 APP_ID = "io.github.ap09.Looper"
-CACHE_DIR = os.path.join(GLib.get_user_cache_dir(), "ap09")
+CACHE_DIR = ap09.cache_dir()
 AUDIO_FILTER_MIME = ["audio/*"]
 
 CSS = b"""
@@ -47,7 +46,8 @@ CSS = b"""
 .badge-playing { background: alpha(@success_color, 0.18); color: @success_color; }
 .badge-saved { background: alpha(@accent_color, 0.18); color: @accent_color; }
 .badge-damaged { background: alpha(@warning_color, 0.2); color: @warning_color; }
-.badge-dup { background: alpha(@window_fg_color, 0.1); }
+.badge-memory { background: alpha(@accent_color, 0.18); color: @accent_color; }
+.badge-deleted { background: alpha(@window_fg_color, 0.1); color: alpha(@window_fg_color, 0.6); }
 .dropzone { border: 2px dashed alpha(@accent_color, 0.6); border-radius: 18px; padding: 22px; }
 .dropzone.hover { background: alpha(@accent_color, 0.12); border-style: solid; }
 .player { padding: 6px 12px; }
@@ -59,22 +59,13 @@ CSS = b"""
 
 # ---------------------------------------------------------------- helpers
 
-def fmt_secs(s: float) -> str:
-    m, sec = divmod(s, 60)
-    return f"{int(m)}:{sec:05.2f}" if m else f"{sec:.2f} s"
-
-
-def loop_secs(loop) -> float:
-    return loop["length"] / ap09.SAMPLE_WIDTH / ap09.SAMPLE_RATE
+fmt_secs = ap09.fmt_secs
+loop_secs = ap09.loop_secs
+cache_path = ap09.cache_path
 
 
 def loop_key(loop) -> str:
-    h = hashlib.sha1(repr((loop["length"], loop["blocks"])).encode()).hexdigest()[:16]
-    return h
-
-
-def cache_path(loop) -> str:
-    return os.path.join(CACHE_DIR, f"loop-{loop_key(loop)}.wav")
+    return os.path.basename(ap09.cache_path(loop))
 
 
 def pcm_to_float(pcm: bytes) -> np.ndarray:
@@ -480,16 +471,30 @@ class LooperWindow(Adw.ApplicationWindow):
         scan.connect("clicked", lambda *_: self.scan_space())
         self.space_row.add_suffix(scan)
         mem.add(self.space_row)
-        self.device_row = Adw.ActionRow(title="Device", subtitle="–")
+        self.device_row = Adw.ExpanderRow(title="Device", subtitle="–")
         self.device_row.add_prefix(Gtk.Image(icon_name="audio-card-symbolic"))
+        self.device_rows = {}
+        for key in ("model", "usb", "format", "info", "index"):
+            row = Adw.ActionRow(title=key, subtitle="–", subtitle_selectable=True)
+            row.add_css_class("property")
+            self.device_row.add_row(row)
+            self.device_rows[key] = row
         mem.add(self.device_row)
         box.append(mem)
 
         # history
         self.history = Adw.PreferencesGroup(
-            title="Loops in memory",
-            description="Older loops stay in memory until it is needed again. "
-                        "Play them here, save them, or put them back on the pedal.")
+            title="Loops",
+            description="▶ playing · ● in memory · ⚠ damaged · ✖ deleted. "
+                        "Numbers are the same as in the CLI (ap09.py list).")
+        self.show_deleted = Gtk.Switch(valign=Gtk.Align.CENTER, tooltip_text="Show deleted loops (list --all)")
+        self.show_deleted.connect("notify::active", lambda *_: self._fill_history())
+        sd = Gtk.Box(spacing=6)
+        sd_label = Gtk.Label(label="deleted")
+        sd_label.add_css_class("dim-label")
+        sd.append(sd_label)
+        sd.append(self.show_deleted)
+        self.history.set_header_suffix(sd)
         self.history_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.history_list.add_css_class("boxed-list")
         self.history.add(self.history_list)
@@ -539,9 +544,7 @@ class LooperWindow(Adw.ApplicationWindow):
 
     def refresh(self):
         def job(lp, progress):
-            info = lp.info()
-            model = int.from_bytes(lp.read(ap09.AREA_MCU, 0x2180, 16)[4:8], "little")
-            return info, model, ap09.all_records(lp), (lp.dev.bus, lp.dev.address)
+            return ap09.read_device_info(lp), ap09.all_records(lp, include_deleted=True)
 
         self.refresh_btn.set_sensitive(False)
         self.worker.submit(job, self._on_refreshed, self._on_refresh_error)
@@ -554,27 +557,32 @@ class LooperWindow(Adw.ApplicationWindow):
         self.upload_btn.set_sensitive(False)
 
     def _on_refreshed(self, result):
-        info, model, recs, (bus, addr) = result
+        d, recs = result
         self.refresh_btn.set_sensitive(True)
         self.upload_btn.set_sensitive(True)
-        self.records = recs
+        self.all_loops = recs
+        self.records = [r for r in recs if not r["deleted"]]
         self.stack.set_visible_child_name("main")
-        name = "NANO LOOPER" if model == 0x2715 else f"unknown model 0x{model:04x}"
+        name = d["model_name"] if d["model"] == 0x2715 else f"unknown model 0x{d['model']:04x}"
         self.title.set_subtitle(name)
-        self.device_row.set_subtitle(f"{name} · USB {ap09.VID:04x}:{ap09.PID:04x} · bus {bus} addr {addr}")
+        self.device_row.set_subtitle(f"{name} · USB {d['usb']} · bus {d['bus']} addr {d['address']}")
+        cur = next((r for r in recs if r["current"]), None)
+        values = {"model": f"0x{d['model']:04x} {d['model_name']}",
+                  "usb": f"{d['usb']} · bus {d['bus']} addr {d['address']}",
+                  "format": d["format"], "info": d["info"],
+                  "index": f"record @ +{cur['offset']:#x}" if cur else "no loop"}
+        for k, v in values.items():
+            self.device_rows[k].set_subtitle(v)
         self.waveforms.clear()
         self.play_buttons.clear()
         self._fill_hero()
         self._fill_history()
 
-    def _state(self, i, r):
-        if r["current"]:
-            return "playing", "playing"
-        if r["same_as"] is not None:
-            return "dup", f"duplicate of #{r['same_as']}"
-        if r["overwritten"]:
-            return "damaged", f"damaged {r['overwritten']}/{len(r['blocks'])}"
-        return "saved", "in memory"
+    @staticmethod
+    def _state(r):
+        key, label = ap09.loop_state(r)
+        icon = ap09.STATES[key][0]
+        return key, f"{icon} {label}"
 
     def _fill_hero(self):
         child = self.hero_buttons.get_first_child()
@@ -594,7 +602,7 @@ class LooperWindow(Adw.ApplicationWindow):
         self.hero_time.remove_css_class("state-empty")
         self.hero_time.add_css_class("state-playing")
         self.hero_time.set_label(fmt_secs(loop_secs(cur)))
-        self.hero_sub.set_label(f"{len(cur['blocks'])} memory blocks · {cur['length']:,} bytes")
+        self.hero_sub.set_label(f"▶ playing #{cur['num']} · {len(cur['blocks'])} blocks · {cur['length']:,} bytes")
         self._register_wave(cur, self.hero_wave)
         play = self._play_button(cur)
         play.add_css_class("suggested-action")
@@ -605,26 +613,28 @@ class LooperWindow(Adw.ApplicationWindow):
     def _fill_history(self):
         while (row := self.history_list.get_row_at_index(0)) is not None:
             self.history_list.remove(row)
-        older = [(i, r) for i, r in enumerate(self.records) if not r["current"]]
-        self.history.set_visible(bool(older))
-        for i, r in reversed(older):  # newest first
-            kind, label = self._state(i, r)
-            row = Adw.ActionRow(title=f"Loop #{i}", subtitle=f"{fmt_secs(loop_secs(r))} · {len(r['blocks'])} blocks")
+        loops = getattr(self, "all_loops", self.records)
+        shown = [r for r in loops if not r["current"] and (self.show_deleted.get_active() or not r["deleted"])]
+        self.history.set_visible(bool([r for r in loops if not r["current"]]))
+        for r in reversed(shown):  # newest first
+            kind, label = self._state(r)
+            row = Adw.ActionRow(title=f"#{r['num']}", subtitle=f"{fmt_secs(loop_secs(r))} · {len(r['blocks'])} blocks")
             row.add_prefix(badge(label, kind))
             wave = Waveform(height=34)
             wave.set_size_request(150, -1)
             wave.set_hexpand(False)
             self._register_wave(r, wave)
             row.add_suffix(wave)
-            if kind != "dup":
-                row.add_suffix(self._play_button(r))
-                row.add_suffix(icon_button("document-save-symbolic", "Save as WAV…", self.download, r))
-                restore = Gtk.Button(label="Put on pedal", valign=Gtk.Align.CENTER,
-                                     tooltip_text="Make this the loop the pedal plays")
-                restore.add_css_class("pill")
-                restore.connect("clicked", lambda *_, i=i, r=r: self.confirm_select(i, r))
-                row.add_suffix(restore)
-                row.add_suffix(icon_button("user-trash-symbolic", "Delete from the list", self.confirm_delete, i, r))
+            row.add_suffix(self._play_button(r))
+            row.add_suffix(icon_button("document-save-symbolic", "Save as WAV…", self.download, r))
+            restore = Gtk.Button(label="Put on pedal", valign=Gtk.Align.CENTER,
+                                 tooltip_text=f"Make #{r['num']} the loop the pedal plays (select {r['num']})")
+            restore.add_css_class("pill")
+            restore.connect("clicked", lambda *_, r=r: self.confirm_select(r["num"], r))
+            row.add_suffix(restore)
+            if not r["deleted"]:
+                row.add_suffix(icon_button("user-trash-symbolic", f"Delete #{r['num']} (delete {r['num']})",
+                                           self.confirm_delete, r["num"], r))
             self.history_list.append(row)
 
     def _register_wave(self, loop, wave):
@@ -657,11 +667,7 @@ class LooperWindow(Adw.ApplicationWindow):
             return
 
         def job(lp, progress):
-            pcm = ap09.read_loop_pcm(lp, loop, progress=progress)
-            tmp = path + ".part"
-            ap09.write_wav(tmp, pcm)
-            os.replace(tmp, path)
-            return path
+            return ap09.fetch_loop_wav(lp, loop, progress=progress)
 
         def done(p):
             self._end_progress()
@@ -696,7 +702,7 @@ class LooperWindow(Adw.ApplicationWindow):
         if self.player.playing:
             self.player.pause()
         elif self.playing_key:
-            loop = next((r for r in self.records if loop_key(r) == self.playing_key), None)
+            loop = next((r for r in getattr(self, "all_loops", self.records) if loop_key(r) == self.playing_key), None)
             if loop:
                 self.player.play(cache_path(loop))
 
@@ -726,8 +732,8 @@ class LooperWindow(Adw.ApplicationWindow):
     # ---------------------------------------------------------- download
 
     def download(self, loop):
-        idx = self.records.index(loop) if loop in self.records else 0
-        dialog = Gtk.FileDialog(title="Save loop as WAV", initial_name=f"ap09-loop{idx:02d}.wav")
+        suffix = "-playing" if loop["current"] else ""
+        dialog = Gtk.FileDialog(title="Save loop as WAV", initial_name=f"ap09-loop{loop['num']:02d}{suffix}.wav")
 
         def chosen(d, res):
             try:
@@ -753,7 +759,7 @@ class LooperWindow(Adw.ApplicationWindow):
                 folder = d.select_folder_finish(res).get_path()
             except GLib.Error:
                 return
-            todo = [(i, r) for i, r in enumerate(self.records) if r["same_as"] is None]
+            todo = [(r["num"], r) for r in self.records]
 
             def step(k=0):
                 if k >= len(todo):
@@ -763,7 +769,7 @@ class LooperWindow(Adw.ApplicationWindow):
 
                 def copy(path):
                     import shutil
-                    suffix = "-current" if r["current"] else ""
+                    suffix = "-playing" if r["current"] else ""
                     shutil.copyfile(path, os.path.join(folder, f"ap09-loop{i:02d}{suffix}.wav"))
                     step(k + 1)
 
@@ -858,8 +864,9 @@ class LooperWindow(Adw.ApplicationWindow):
         def done(blocks):
             self._end_progress()
             # seed the cache so the new loop can be previewed without reading it back
-            loop = {"length": len(pcm) + (-len(pcm) % ap09.TAIL_UNIT), "blocks": blocks}
-            ap09.write_wav(cache_path(loop), pcm + bytes(-len(pcm) % ap09.TAIL_UNIT))
+            padded = pcm[:len(pcm) - len(pcm) % ap09.SAMPLE_WIDTH]
+            padded += bytes(-len(padded) % ap09.TAIL_UNIT)
+            ap09.seed_cache({"length": len(padded), "blocks": blocks}, padded)
             self.done_dialog("Uploaded", f"{os.path.basename(path)} is on the pedal.\n\n"
                              "Unplug and replug the pedal so it loads the new loop.")
             self.refresh()
@@ -871,30 +878,30 @@ class LooperWindow(Adw.ApplicationWindow):
 
     def confirm_select(self, i, r):
         if r["current"]:
-            self.toast(f"Loop #{i} is already on the pedal")
+            self.toast(f"#{i} is already playing")
             return
         warn = ""
         if r["overwritten"]:
             warn = f"\n\n⚠ {r['overwritten']} of its {len(r['blocks'])} blocks were reused: it will sound damaged."
-        dlg = Adw.AlertDialog(heading=f"Put loop #{i} on the pedal?",
+        dlg = Adw.AlertDialog(heading=f"Put #{i} on the pedal?",
                               body=f"{fmt_secs(loop_secs(r))}. It replaces the current loop "
                                    f"(which stays in memory).{warn}")
         dlg.add_response("cancel", "Cancel")
         dlg.add_response("ok", "Put on pedal")
         dlg.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
         dlg.connect("response", lambda d, resp: resp == "ok" and self._run_simple(
-            lambda lp, p: ap09.select_loop(lp, r), f"Loop #{i} is on the pedal. Replug it to load."))
+            lambda lp, p: ap09.select_loop(lp, r), f"#{i} is now playing. Replug the pedal to load it."))
         dlg.present(self)
 
     def confirm_delete(self, i, r):
-        dlg = Adw.AlertDialog(heading=f"Delete loop #{i}?",
+        dlg = Adw.AlertDialog(heading=f"Delete #{i}?",
                               body=f"{fmt_secs(loop_secs(r))}. It disappears from the list. The audio "
                                    "cannot be wiped over USB and is overwritten when the memory is needed.")
         dlg.add_response("cancel", "Cancel")
         dlg.add_response("delete", "Delete")
         dlg.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
         dlg.connect("response", lambda d, resp: resp == "delete" and self._run_simple(
-            lambda lp, p: ap09.delete_loop(lp, r), f"Loop #{i} deleted"))
+            lambda lp, p: ap09.delete_loop(lp, r), f"#{i} deleted"))
         dlg.present(self)
 
     def confirm_clear(self):
@@ -995,18 +1002,66 @@ class LooperWindow(Adw.ApplicationWindow):
         self.toasts.add_toast(Adw.Toast(title=text, timeout=3))
 
     def show_about(self):
-        about = Adw.AboutDialog(
-            application_name="AP-09 Looper",
-            application_icon="audio-x-generic",
-            developer_name="wdog",
-            developers=["wdog <wdog666@gmail.com>"],
-            copyright="© 2026 wdog",
-            version=ap09.__version__,
-            comments="Download, preview and upload loops on the Ammoon AP-09 nano looper.\n"
-                     "Protocol reverse-engineered from the official Windows tool.",
-            support_url="mailto:wdog666@gmail.com",
-            license_type=Gtk.License.MIT_X11)
-        about.present(self)
+        def label(text, *classes, **kw):
+            lbl = Gtk.Label(label=text, wrap=True, justify=kw.pop("justify", Gtk.Justification.CENTER), **kw)
+            for c in classes:
+                lbl.add_css_class(c)
+            return lbl
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
+                      margin_top=24, margin_bottom=32, margin_start=32, margin_end=32)
+        head = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        head.append(Gtk.Image(icon_name="audio-x-generic", pixel_size=96))
+        head.append(label("AP-09 Looper", "title-1"))
+        head.append(label(f"version {ap09.__version__}", "dim-label"))
+        box.append(head)
+        box.append(label(
+            "Manage the loop stored on an Ammoon AP-09 nano looper from your computer, "
+            "over the pedal's USB cable. The pedal has no official Linux software: its USB "
+            "protocol was reverse-engineered from the Windows tool."))
+
+        what = Adw.PreferencesGroup(title="What it does")
+        for icon, title, sub in (
+            ("media-playback-start-symbolic", "Listen", "play any loop on the computer, with its waveform"),
+            ("document-save-symbolic", "Download", "save a loop as WAV: mono, 24-bit, 46875 Hz, bit-exact"),
+            ("document-send-symbolic", "Upload", "put any audio file (wav, mp3, flac…) on the pedal"),
+            ("edit-undo-symbolic", "Put back", "old loops stay in memory: make one play again"),
+            ("user-trash-symbolic", "Delete / Clear", "remove loops from the list or leave the pedal empty"),
+            ("drive-harddisk-symbolic", "Free space", "see how much audio still fits"),
+        ):
+            row = Adw.ActionRow(title=title, subtitle=sub)
+            row.add_prefix(Gtk.Image(icon_name=icon))
+            what.add(row)
+        box.append(what)
+
+        good = Adw.PreferencesGroup(title="Good to know")
+        for title, sub in (
+            ("Replug after changes", "after upload, put back, delete or clear, unplug and replug the pedal"),
+            ("Audio is never wiped", "the pedal ignores erase over USB: deleted loops only disappear from the list"),
+            ("One program at a time", "don't use the CLI (ap09.py) while this app is working on the pedal"),
+        ):
+            good.add(Adw.ActionRow(title=title, subtitle=sub))
+        box.append(good)
+
+        who = Adw.PreferencesGroup(title="Author")
+        author = Adw.ActionRow(title="wdog", subtitle="wdog666@gmail.com", activatable=True)
+        author.add_prefix(Gtk.Image(icon_name="avatar-default-symbolic"))
+        author.add_suffix(Gtk.Image(icon_name="mail-send-symbolic"))
+        author.connect("activated", lambda *_: Gio.AppInfo.launch_default_for_uri("mailto:wdog666@gmail.com", None))
+        who.add(author)
+        lic = Adw.ActionRow(title="MIT License",
+                            subtitle="free to use, change and improve; keep the author's copyright notice")
+        lic.add_prefix(Gtk.Image(icon_name="emblem-documents-symbolic"))
+        who.add(lic)
+        box.append(who)
+        box.append(label("© 2026 wdog · not affiliated with Ammoon or Rowin · use at your own risk",
+                         "dim-label", "caption"))
+
+        view = Adw.ToolbarView(content=Gtk.ScrolledWindow(
+            child=Adw.Clamp(maximum_size=520, child=box), propagate_natural_height=True))
+        view.add_top_bar(Adw.HeaderBar())
+        dlg = Adw.Dialog(title="About AP-09 Looper", content_width=560, content_height=720, child=view)
+        dlg.present(self)
 
     def _on_key(self, ctrl, keyval, keycode, state):
         if keyval == Gdk.KEY_F5:
