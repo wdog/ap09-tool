@@ -788,13 +788,11 @@ record is. Read-only.""")
     p = sub.add_parser(
         "list", formatter_class=fmt, help="list current and older loops still in memory",
         description="""\
-List every loop recorded in the pedal's index, oldest first. The pedal plays only
-the one marked CURRENT; the older ones usually still have their audio in memory
-and can be downloaded (download -r N) or made current again (select N).
-
-notes:
-  partly overwritten    some of its memory blocks were reused by a later loop
-Read-only.""")
+List the loops in the pedal's index, oldest first, one line per audio (records that
+point at the same audio, e.g. after 'select', are merged). The pedal plays only the
+one marked playing; the others usually still have their audio in memory and can be
+downloaded (download -r N) or made current again (select N).
+'damaged N/M': N of its M memory blocks were reused by a later loop. Read-only.""")
     p.set_defaults(func=cmd_list)
 
     p = sub.add_parser(

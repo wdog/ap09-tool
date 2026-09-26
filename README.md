@@ -47,8 +47,8 @@ What it does:
 - **Upload**: drag an audio file onto the window, or click the drop zone / **Upload**
   (Ctrl+O). A preview with the waveform and length comes first, then a confirmation.
   Progress shows under the header bar.
-- **Loops in memory**: every older loop with a state badge (in memory / damaged
-  ), a small waveform, ▶ play, 💾 save, and **Put on pedal** (`select`).
+- **Loops in memory**: every older loop with a state badge (in memory / damaged),
+  a small waveform, ▶ play, 💾 save, and **Put on pedal** (`select`).
 - **Player bar** at the bottom: play/pause, click the waveform to seek, stop.
 - **Memory**: free space scan (about 4 min) with a level bar, device info.
 - Menu: scan space, clear, download all loops to a folder, open the cache.
