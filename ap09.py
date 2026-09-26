@@ -116,8 +116,38 @@ class Looper:
                 if dev.is_kernel_driver_active(intf.bInterfaceNumber):
                     dev.detach_kernel_driver(intf.bInterfaceNumber)
                     self.detached.append(intf.bInterfaceNumber)
+        # Always (re)select the configuration: it resets the endpoints' state, which
+        # the firmware needs after a previous session (skipping it -> pipe errors).
         dev.set_configuration()
         usb.util.claim_interface(dev, INTERFACE)
+        self._sync()
+
+    def _drain(self):
+        """Throw away reply bytes left over from an interrupted previous run."""
+        for _ in range(10000):
+            try:
+                self.dev.read(EP_IN, 4096, timeout=50)
+            except usb.core.USBError:
+                return
+
+    def _sync(self):
+        """Make sure the pipe is clean: drain, then check that 'info' answers properly.
+        If not (stalled endpoint after an aborted transfer), USB-reset the pedal once.
+        clear_halt is avoided on purpose: this firmware wedges after it."""
+        for attempt in range(2):
+            self._drain()
+            try:
+                self.command(CMD_INFO, timeout=1000)
+                return
+            except DeviceError:
+                if attempt:
+                    raise
+            try:
+                usb.util.release_interface(self.dev, INTERFACE)
+                self.dev.reset()
+                usb.util.claim_interface(self.dev, INTERFACE)
+            except usb.core.USBError as e:
+                raise DeviceError(f"pedal not responding and USB reset failed ({e}); unplug/replug it")
 
     def close(self):
         try:
@@ -551,6 +581,58 @@ def cmd_select(lp, args):
           "Unplug/replug the pedal so it reloads the loop.", file=sys.stderr)
 
 
+def build_clear_record() -> bytes:
+    """Record with the valid flag at 0: the pedal then has no loop (it writes the same when
+    you clear the loop with the footswitch)."""
+    rec = bytearray(b"\xff" * RECORD_SIZE)
+    rec[0:7] = b"looper\x00"
+    rec[RECORD_SIZE - 8:RECORD_SIZE - 1] = b"looper\x00"
+    rec[8] = 0
+    return bytes(rec)
+
+
+def cmd_clear(lp, args):
+    current, last_off, _ = scan_index(lp)
+    if not current and not args.yes:
+        print("the pedal already has no loop", file=sys.stderr)
+        return
+    if not args.yes:
+        secs = current["length"] / SAMPLE_WIDTH / SAMPLE_RATE
+        answer = input(f"remove the current {secs:.2f} s loop from the pedal? "
+                       "(it stays in 'list' and can come back with 'select') [y/N] ")
+        if answer.strip().lower() not in ("y", "yes", "s", "si", "sì"):
+            print("aborted", file=sys.stderr)
+            return
+    slot = find_record_slot(lp, last_off)
+    rec = build_clear_record()
+    lp.write(AREA_NAND, INDEX_BLOCK * BLOCK_SIZE + slot * PAGE_SIZE, rec)
+    if scan_index(lp)[0] is not None:
+        raise DeviceError("clear record did not take effect")
+    print("the pedal now has no loop. Unplug/replug the pedal so it reloads.", file=sys.stderr)
+
+
+def cmd_space(lp, args):
+    _, last_off, used = scan_index(lp)
+    free = 0
+    for blk in range(INDEX_BLOCK):
+        if blk not in used and lp.block_is_erased(blk):
+            free += 1
+        if blk % 20 == 0:
+            print(f"\r  scanning block {blk}/{INDEX_BLOCK}, {free} empty so far",
+                  end="", file=sys.stderr, flush=True)
+    print(file=sys.stderr)
+    per_block_s = PAGE_AUDIO * PAGES_PER_BLOCK / SAMPLE_WIDTH / SAMPLE_RATE
+    slots = 0
+    base = INDEX_BLOCK * BLOCK_SIZE
+    first = 0 if last_off is None else last_off // PAGE_SIZE + 2
+    for slot in range(first, PAGES_PER_BLOCK - 1, 2):
+        if lp.checksum(AREA_NAND, base + slot * PAGE_SIZE, RECORD_SIZE) == (0xFF * RECORD_SIZE) & 0xFFFF:
+            slots += 1
+    print(f"empty blocks: {free} -> max upload {min(free, MAX_BLOCKS) * per_block_s:.0f} s "
+          f"({free * per_block_s:.0f} s in total)")
+    print(f"free index slots: {slots} (each upload or select uses one)")
+
+
 def cmd_probe(lp, args):
     body = bytes.fromhex(args.body) if args.body else b""
     print(lp.command(int(args.cmd, 16), body).hex(" "))
@@ -566,38 +648,141 @@ def cmd_dump(lp, args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Ammoon AP-09 nano looper USB tool")
-    sub = ap.add_subparsers(dest="command", required=True)
+    fmt = argparse.RawDescriptionHelpFormatter
+    ap = argparse.ArgumentParser(
+        prog="ap09.py", formatter_class=fmt,
+        description="Copy loops between an Ammoon AP-09 nano looper (USB 0416:5555) and this computer.",
+        epilog="""\
+typical use:
+  ap09.py info                     what is on the pedal
+  ap09.py list                     current loop + older loops still in memory
+  ap09.py download loop.wav        save the current loop
+  ap09.py upload song.mp3          put an audio file on the pedal
+  ap09.py select 3                 play old loop #3 again
+  ap09.py clear                    leave the pedal without a loop
 
-    sub.add_parser("info", help="show device and stored loop info").set_defaults(func=cmd_info)
+After upload / select / clear: unplug and replug the pedal so it reloads.
+Audio on the pedal: mono, 24-bit, 46875 Hz. Run 'ap09.py COMMAND -h' for details.
+Without the udev rule (see README) every command needs sudo.""")
+    sub = ap.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
-    sub.add_parser("list", help="list the current loop and older loops still in the index") \
-        .set_defaults(func=cmd_list)
+    p = sub.add_parser(
+        "info", formatter_class=fmt, help="show device model and the current loop",
+        description="""\
+Show the device info block, the model id (must be 0x2715 = NANO LOOPER) and the
+loop the pedal currently plays: length, size, memory blocks and where its index
+record is. Read-only.""")
+    p.set_defaults(func=cmd_info)
 
-    p = sub.add_parser("download", help="save the loop stored on the pedal as a WAV file")
-    p.add_argument("file", help="output WAV (or output directory with --all)")
-    p.add_argument("-r", "--record", type=int, help="download an older loop (number from 'list')")
-    p.add_argument("-a", "--all", action="store_true", help="download every loop in the index into directory FILE")
+    p = sub.add_parser(
+        "list", formatter_class=fmt, help="list current and older loops still in memory",
+        description="""\
+List every loop recorded in the pedal's index, oldest first. The pedal plays only
+the one marked CURRENT; the older ones usually still have their audio in memory
+and can be downloaded (download -r N) or made current again (select N).
+
+notes:
+  same audio as #N      duplicate record pointing to the same audio
+  partly overwritten    some of its memory blocks were reused by a later loop
+Read-only.""")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser(
+        "download", formatter_class=fmt, help="save a loop from the pedal as WAV",
+        description="""\
+Save a loop as a WAV file: mono, 24-bit PCM, 46875 Hz (the pedal's native
+format, bit-exact). About 12 s for a 20 s loop. Read-only on the pedal.
+
+examples:
+  ap09.py download loop.wav          current loop
+  ap09.py download -r 3 old.wav      loop #3 from 'list'
+  ap09.py download -a myloops/       every loop into myloops/loopNN.wav
+
+convert afterwards if needed:
+  ffmpeg -i loop.wav -ar 48000 loop48k.wav
+  ffmpeg -i loop.wav -b:a 320k loop.mp3""")
+    p.add_argument("file", help="output WAV file (a directory with --all)")
+    p.add_argument("-r", "--record", type=int, metavar="N", help="download loop #N from 'list' instead of the current one")
+    p.add_argument("-a", "--all", action="store_true", help="download every loop into directory FILE")
     p.set_defaults(func=cmd_download)
 
-    p = sub.add_parser("upload", help="replace the loop on the pedal with an audio file (wav/mp3/flac/...)")
-    p.add_argument("file")
-    p.add_argument("--force", action="store_true", help="write even if the model id is not NANO LOOPER")
+    p = sub.add_parser(
+        "upload", formatter_class=fmt, help="put an audio file on the pedal as the current loop",
+        description="""\
+Write an audio file to the pedal and make it the current loop.
+
+input: anything ffmpeg can read (wav, mp3, flac, ogg, ...). It is converted to
+mono, 24-bit, 46875 Hz; stereo is mixed down. A WAV already in that format is
+sent as-is (no ffmpeg needed). Max ~10 min, in practice limited by free space.
+
+how: the pedal's erase command does not work, so only memory blocks that are
+already empty are used (check with 'space'); every block is verified with the
+pedal's checksum. The previous loop is NOT deleted: it stays in 'list' and can
+come back with 'select'. Takes ~1 s per second of audio.
+
+After the upload unplug and replug the pedal.""")
+    p.add_argument("file", help="audio file to upload")
+    p.add_argument("--force", action="store_true", help="write even if the model id is not NANO LOOPER (0x2715)")
     p.set_defaults(func=cmd_upload)
 
-    p = sub.add_parser("select", help="make an older loop from 'list' the current one again")
-    p.add_argument("record", type=int)
+    p = sub.add_parser(
+        "select", formatter_class=fmt, help="make an older loop from 'list' current again",
+        description="""\
+Make loop #N from 'list' the current loop. No audio is copied: a new index
+record pointing at that loop's memory is added. If 'list' says the loop was
+partly overwritten, it will play partly corrupted. Uses one index slot.
+
+After select unplug and replug the pedal.""")
+    p.add_argument("record", type=int, metavar="N", help="loop number from 'list'")
     p.set_defaults(func=cmd_select)
 
-    p = sub.add_parser("dump", help="(debug) read raw memory")
+    p = sub.add_parser(
+        "clear", formatter_class=fmt, help="leave the pedal without a loop",
+        description="""\
+Remove the current loop, like clearing it on the pedal: a 'no loop' record is
+added to the index. Asks for confirmation unless -y is given.
+
+limits: the audio itself cannot be wiped (the pedal's erase command does not
+work over USB), so older loops stay visible in 'list' and can be brought back
+with 'select'. Uses one index slot.
+
+After clear unplug and replug the pedal.""")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    p.set_defaults(func=cmd_clear)
+
+    p = sub.add_parser(
+        "space", formatter_class=fmt, help="how much empty memory is left for uploads (~4 min)",
+        description="""\
+Scan the whole audio memory (1980 blocks, ~0.1 s each, ~4 min) and report how
+many blocks are empty, i.e. usable by 'upload', and how many index slots are
+free (upload, select and clear each use one). Read-only.""")
+    p.set_defaults(func=cmd_space)
+
+    p = sub.add_parser(
+        "dump", formatter_class=fmt, help="(debug) read raw memory",
+        description="""\
+Read raw memory and print it as hex (or save it with -o). Read-only.
+
+areas: 0 = MCU flash (firmware/settings), 1 = 256 MiB NAND (audio + index)
+examples:
+  ap09.py dump 1 0xF780000 0x60      first index record
+  ap09.py dump 0 0x2180 16           model id is bytes 4..7""")
     p.add_argument("area", help="0 = MCU flash, 1 = NAND")
-    p.add_argument("addr")
-    p.add_argument("length")
-    p.add_argument("-o", "--out")
+    p.add_argument("addr", help="start address (e.g. 0xF780000)")
+    p.add_argument("length", help="number of bytes (e.g. 0x60)")
+    p.add_argument("-o", "--out", metavar="FILE", help="write raw bytes to FILE instead of printing")
     p.set_defaults(func=cmd_dump)
 
-    p = sub.add_parser("probe", help="(debug) send a raw command, e.g. probe 11")
-    p.add_argument("cmd", help="command byte, hex")
+    p = sub.add_parser(
+        "probe", formatter_class=fmt, help="(debug) send a raw protocol command",
+        description="""\
+Send one raw command packet and print the reply body (see README, 'Packet
+format'). Only for protocol work: 0x21/0x22 write to the pedal.
+
+examples:
+  ap09.py probe 11                                   device info
+  ap09.py probe 23 010000780f600000                  read 0x60 bytes of NAND at 0xF780000""")
+    p.add_argument("cmd", help="command byte, hex (e.g. 11)")
     p.add_argument("body", nargs="?", help="body bytes, hex")
     p.set_defaults(func=cmd_probe)
 
