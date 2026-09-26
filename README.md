@@ -111,14 +111,24 @@ power-on the pedal rewrites its index and the history disappears.
 ### What `list` shows
 
 ```
-Pedal: ▶ plays loop #3 (19.91 s)
-
- #   length  status
- 0   13.93s  💾 previous loop, audio still in memory → 'select 0' to play it again
- 1    7.94s  ⚠ previous loop, damaged: 3 of 9 memory blocks reused by a later loop
- 2   19.91s  ↺ duplicate of #3 (same audio)
- 3   19.91s  ▶ current loop, the one the pedal plays
+┌───────────────────────────────────────────────────────────────────────────┐
+│ Pedal: ▶ plays loop #3 (19.91 s)                                          │
+├───┬─────────┬──────────────────────────────────┬──────────────────────────┤
+│ # │ Length  │ Status                           │ Action                   │
+├───┼─────────┼──────────────────────────────────┼──────────────────────────┤
+│ 0 │ 13.93 s │ ● previous loop, still in memory │ select 0 / download -r 0 │
+│ 1 │ 7.94 s  │ ⚠ damaged (3/9 blocks reused)    │ -                        │
+│ 2 │ 19.91 s │ ↺ duplicate of #3                │ -                        │
+│ 3 │ 19.91 s │ ▶ current loop (playing)         │ download -r 3            │
+└───┴─────────┴──────────────────────────────────┴──────────────────────────┘
 ```
+
+- ▶ the loop the pedal plays.
+- ● an older loop whose audio is still in memory. You can download it or make it
+  current again.
+- ⚠ an older loop that has been partly overwritten by a later one.
+- ↺ a duplicate record pointing to the same audio.
+- The title shows ■ when the pedal has no loop (empty or after `clear`).
 
 ### Bring back an older loop
 

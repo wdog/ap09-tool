@@ -505,35 +505,63 @@ def cmd_info(lp, args):
           f"(first {loop['blocks'][0]}), index record #{loop['seq']:#x} at +{loop['offset']:#x}")
 
 
+def _width(text: str) -> int:
+    import unicodedata
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+
+
+def print_table(headers, rows, title=None):
+    """Box-drawing table; column widths account for wide characters."""
+    cols = len(headers)
+    w = [max(_width(str(r[i])) for r in [headers] + rows) for i in range(cols)]
+    total = sum(w) + 3 * cols - 1
+
+    def line(l, m, r, fill="─"):
+        return l + m.join(fill * (x + 2) for x in w) + r
+
+    def row(cells):
+        return "│" + "│".join(f" {c}{' ' * (w[i] - _width(str(c)))} " for i, c in enumerate(cells)) + "│"
+
+    if title:
+        print("┌" + "─" * total + "┐")
+        print("│ " + title + " " * (total - 1 - _width(title)) + "│")
+        print(line("├", "┬", "┤"))
+    else:
+        print(line("┌", "┬", "┐"))
+    print(row(headers))
+    print(line("├", "┼", "┤"))
+    for r in rows:
+        print(row(r))
+    print(line("└", "┴", "┘"))
+
+
 def cmd_list(lp, args):
     recs = all_records(lp)
     current = next((i for i, r in enumerate(recs) if r["current"]), None)
     if current is not None:
         secs = recs[current]["length"] / SAMPLE_WIDTH / SAMPLE_RATE
-        print(f"Pedal: ▶ plays loop #{current} ({secs:.2f} s)")
+        title = f"Pedal: ▶ plays loop #{current} ({secs:.2f} s)"
     else:
-        print("Pedal: ⏹ no loop (empty or cleared)")
-    if not recs:
-        return
-    print()
-    print(" #   length  status")
+        title = "Pedal: ■ no loop (empty or cleared)"
+    rows = []
     for i, r in enumerate(recs):
-        secs = r["length"] / SAMPLE_WIDTH / SAMPLE_RATE
+        secs = f"{r['length'] / SAMPLE_WIDTH / SAMPLE_RATE:.2f} s"
         if r["current"]:
-            status = "▶ current loop, the one the pedal plays"
+            status, action = "▶ current loop (playing)", f"download -r {i}"
         elif r["same_as"] is not None:
-            status = f"↺ duplicate of #{r['same_as']} (same audio)"
+            status, action = f"↺ duplicate of #{r['same_as']}", "-"
         elif r["overwritten"]:
-            status = (f"⚠ previous loop, damaged: {r['overwritten']} of {len(r['blocks'])} "
-                      "memory blocks reused by a later loop")
+            status = f"⚠ damaged ({r['overwritten']}/{len(r['blocks'])} blocks reused)"
+            action = "-"
         else:
-            status = f"💾 previous loop, audio still in memory → 'select {i}' to play it again"
-        print(f"{i:2d}  {secs:6.2f}s  {status}")
-    if len(recs) > 1 or current is None:
-        print()
-        print("Previous loops are history only: the pedal forgets them when it restarts\n"
-              "(it rewrites its index at power-on); their audio is overwritten only when\n"
-              "the memory is needed again. 'download -r N' saves one, 'select N' restores it.")
+            status, action = "● previous loop, still in memory", f"select {i} / download -r {i}"
+        rows.append([i, secs, status, action])
+    if not rows:
+        print_table(["#", "Length", "Status", "Action"], [["-", "-", "no loops recorded", "-"]], title)
+        return
+    print_table(["#", "Length", "Status", "Action"], rows, title)
+    if current is None or len(recs) > 1:
+        print("History (●) is forgotten by the pedal at power-on; the audio stays in memory until reused.")
 
 
 def cmd_download(lp, args):
