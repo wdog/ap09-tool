@@ -523,11 +523,11 @@ def _color(code: str, text: str) -> str:
     return f"\033[{code}m{text}\033[0m"
 
 
-STATES = {  # key: (icon, label, ANSI color)
-    "playing": ("▶", "playing", "1;32"),
-    "saved": ("●", "saved", "36"),
-    "damaged": ("⚠", "damaged", "33"),
-    "dup": ("↺", "duplicate", "2"),
+STATES = {  # key: (icon, label, ANSI color, legend)
+    "playing": ("▶", "playing", "1;32", "loop the pedal plays now"),
+    "saved": ("●", "saved", "36", "old loop, not playing, audio still in memory -> select N / download -r N"),
+    "damaged": ("⚠", "damaged", "33", "old loop, N/M blocks overwritten by a later one"),
+    "dup": ("↺", "duplicate", "2", "same audio as another entry"),
 }
 
 
@@ -543,6 +543,7 @@ def cmd_list(lp, args):
         return
     print()
     print(_color("1", " #    length  blocks  state"))
+    seen = []
     for i, r in enumerate(recs):
         secs = r["length"] / SAMPLE_WIDTH / SAMPLE_RATE
         if r["current"]:
@@ -553,8 +554,16 @@ def cmd_list(lp, args):
             key, extra = "damaged", f" {r['overwritten']}/{len(r['blocks'])}"
         else:
             key, extra = "saved", ""
-        icon, label, color = STATES[key]
+        icon, label, color, _ = STATES[key]
         print(f"{i:2d}  {secs:7.2f}s  {len(r['blocks']):6d}  " + _color(color, f"{icon} {label}{extra}"))
+        if key not in seen:
+            seen.append(key)
+    print()
+    for key in seen:
+        icon, label, color, legend = STATES[key]
+        print(_color("2", f"{icon} {label:<9} {legend}"))
+    if "saved" in seen:
+        print(_color("2", "  history is lost when the pedal restarts"))
 
 
 def cmd_download(lp, args):

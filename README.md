@@ -122,7 +122,15 @@ power-on the pedal rewrites its index and the history disappears.
  1     7.94s       9  ⚠ damaged 3/9
  2    19.91s      22  ↺ duplicate of #3
  3    19.91s      22  ▶ playing
+
+▶ playing   loop the pedal plays now
+● saved     old loop, not playing, audio still in memory -> select N / download -r N
+⚠ damaged   old loop, N/M blocks overwritten by a later one
+↺ duplicate same audio as another entry
+  history is lost when the pedal restarts
 ```
+
+The legend lists only the states that appear.
 
 Colours are used on a terminal; set `NO_COLOR=1` to turn them off.
 
