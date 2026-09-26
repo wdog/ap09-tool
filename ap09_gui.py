@@ -51,6 +51,9 @@ CSS = b"""
 .dropzone { border: 2px dashed alpha(@accent_color, 0.6); border-radius: 18px; padding: 22px; }
 .dropzone.hover { background: alpha(@accent_color, 0.12); border-style: solid; }
 .player { padding: 6px 12px; }
+.progress-card { padding: 14px 18px; margin: 10px 12px 0 12px; }
+.progress-card progressbar trough, .progress-card progressbar progress { min-height: 12px; border-radius: 6px; }
+.progress-pct { font-size: 2em; font-weight: 800; font-feature-settings: "tnum"; }
 """
 
 
@@ -176,13 +179,23 @@ def icon_button(icon: str, tooltip: str, cb, *args) -> Gtk.Button:
 
 # ---------------------------------------------------------------- worker
 
+class Cancelled(Exception):
+    pass
+
+
 class Worker:
-    """Serialises every pedal job on one thread. Jobs get a fresh Looper each time."""
+    """Serialises every pedal job on one thread. Jobs get a fresh Looper each time.
+    cancel() stops the running job at its next progress report (between two USB
+    commands), which is always a safe point."""
 
     def __init__(self):
         self.q = queue.Queue()
         self.busy = False
+        self.cancel_flag = threading.Event()
         threading.Thread(target=self._run, daemon=True).start()
+
+    def cancel(self):
+        self.cancel_flag.set()
 
     def submit(self, fn, on_done=None, on_error=None, on_progress=None):
         self.q.put((fn, on_done, on_error, on_progress))
@@ -191,17 +204,23 @@ class Worker:
         while True:
             fn, on_done, on_error, on_progress = self.q.get()
             self.busy = True
+            self.cancel_flag.clear()
             lp = None
             try:
                 lp = ap09.Looper()
 
                 def progress(frac, text, on_progress=on_progress):
+                    if self.cancel_flag.is_set():
+                        raise Cancelled()
                     if on_progress:
                         GLib.idle_add(on_progress, frac, text)
 
                 result = fn(lp, progress)
                 if on_done:
                     GLib.idle_add(on_done, result)
+            except Cancelled:
+                if on_error:
+                    GLib.idle_add(on_error, "__cancelled__")
             except Exception as e:  # noqa: BLE001 - everything goes to the UI
                 traceback.print_exc()
                 msg = str(e)
@@ -300,10 +319,9 @@ class LooperWindow(Adw.ApplicationWindow):
         header.pack_end(self._build_menu())
         header.pack_end(self.refresh_btn)
 
-        # progress bar under the header
-        self.progress = Gtk.ProgressBar(show_text=True)
-        self.progress.add_css_class("osd")
-        self.progress_rev = Gtk.Revealer(child=self.progress, transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN)
+        # progress card under the header
+        self.progress_rev = Gtk.Revealer(child=self._build_progress_card(),
+                                         transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN)
 
         # pages
         self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
@@ -360,6 +378,37 @@ class LooperWindow(Adw.ApplicationWindow):
             act.connect("activate", lambda _a, _p, f=cb: f())
             self.add_action(act)
         return Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu, tooltip_text="Menu")
+
+    def _build_progress_card(self):
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        card.add_css_class("card")
+        card.add_css_class("progress-card")
+        top = Gtk.Box(spacing=12)
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+        self.progress_title = Gtk.Label(xalign=0)
+        self.progress_title.add_css_class("heading")
+        self.progress_detail = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        self.progress_detail.add_css_class("dim-label")
+        texts.append(self.progress_title)
+        texts.append(self.progress_detail)
+        self.progress_pct = Gtk.Label()
+        self.progress_pct.add_css_class("progress-pct")
+        self.cancel_btn = Gtk.Button(label="Cancel", valign=Gtk.Align.CENTER,
+                                     tooltip_text="Stop safely after the current step")
+        self.cancel_btn.add_css_class("pill")
+        self.cancel_btn.connect("clicked", lambda *_: self._cancel())
+        top.append(texts)
+        top.append(self.progress_pct)
+        top.append(self.cancel_btn)
+        card.append(top)
+        self.progress = Gtk.ProgressBar()
+        card.append(self.progress)
+        return card
+
+    def _cancel(self):
+        self.cancel_btn.set_sensitive(False)
+        self.cancel_btn.set_label("Stopping…")
+        self.worker.cancel()
 
     def _build_disconnected(self):
         page = Adw.StatusPage(icon_name="audio-input-microphone-symbolic",
@@ -888,8 +937,15 @@ class LooperWindow(Adw.ApplicationWindow):
     # ---------------------------------------------------------- progress / messages
 
     def _start_progress(self, text, pulse=False):
-        self.progress.set_text(text)
+        import time
+        self._progress_t0 = time.monotonic()
+        self.progress_title.set_label(text)
+        self.progress_detail.set_label("starting…")
+        self.progress_pct.set_label("")
         self.progress.set_fraction(0)
+        self.cancel_btn.set_label("Cancel")
+        self.cancel_btn.set_sensitive(True)
+        self.cancel_btn.set_visible(not pulse)
         self.progress_rev.set_reveal_child(True)
         self._pulsing = pulse
         if pulse:
@@ -903,9 +959,16 @@ class LooperWindow(Adw.ApplicationWindow):
         return self._pulsing
 
     def _on_progress(self, frac, text):
+        import time
         self._pulsing = False
         self.progress.set_fraction(frac)
-        self.progress.set_text(text)
+        self.progress_pct.set_label(f"{100 * frac:.0f}%")
+        eta = ""
+        elapsed = time.monotonic() - self._progress_t0
+        if 0.03 < frac < 1 and elapsed > 2:
+            left = elapsed * (1 - frac) / frac
+            eta = f"  ·  about {int(left // 60)}:{int(left % 60):02d} left"
+        self.progress_detail.set_label(text + eta)
 
     def _end_progress(self):
         self._pulsing = False
@@ -915,6 +978,10 @@ class LooperWindow(Adw.ApplicationWindow):
 
     def _job_error(self, msg):
         self._end_progress()
+        if msg == "__cancelled__":
+            self.toast("Stopped. Nothing on the pedal changed.")
+            self.refresh()
+            return
         dlg = Adw.AlertDialog(heading="Something went wrong", body=msg)
         dlg.add_response("ok", "OK")
         dlg.present(self)

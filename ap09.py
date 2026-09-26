@@ -212,9 +212,13 @@ class Looper:
 
     def block_is_erased(self, blk: int) -> bool:
         a = blk * BLOCK_SIZE
+        # Quick reject (~5 ms): used blocks almost always have data in their first bytes.
+        # Page 63 is checked too, because a loop's first chunk lives there.
+        if self.read(AREA_NAND, a, 16) != b"\xff" * 16 or \
+                self.read(AREA_NAND, a + (PAGES_PER_BLOCK - 1) * PAGE_SIZE, 16) != b"\xff" * 16:
+            return False
         n = BLOCK_SIZE - 1  # odd length so an all-FF block (0xff01) can't be confused with all-00
-        return self.checksum(AREA_NAND, a, n) == (0xFF * n) & 0xFFFF and \
-            self.read(AREA_NAND, a, 16) == b"\xff" * 16
+        return self.checksum(AREA_NAND, a, n) == (0xFF * n) & 0xFFFF  # full check, ~0.1 s
 
     def erase_block(self, area: int, addr: int):
         self.status_command(CMD_ERASE, bytes([area]) + addr.to_bytes(4, "little"), timeout=30000)
@@ -372,11 +376,15 @@ def page_for_chunk(block_index: int, chunk: int) -> int:
 
 
 def _report(progress, fraction: float, text: str, end=False):
-    """progress: True = print to stderr, callable(fraction, text) = GUI, falsy = silent."""
+    """progress: True = bar on stderr, callable(fraction, text) = GUI, falsy = silent."""
     if callable(progress):
         progress(fraction, text)
     elif progress:
-        print(f"\r  {text}", end="\n" if end else "", file=sys.stderr, flush=True)
+        width = 28
+        fill = int(round(max(0.0, min(1.0, fraction)) * width))
+        bar = "█" * fill + "░" * (width - fill)
+        line = f"\r  [{bar}] {100 * fraction:5.1f}%  {text}"
+        print(f"{line:<110}", end="\n" if end else "", file=sys.stderr, flush=True)
 
 
 def read_loop_pcm(lp: Looper, loop, progress=True) -> bytes:
@@ -394,8 +402,8 @@ def read_loop_pcm(lp: Looper, loop, progress=True) -> bytes:
             remaining -= n
             done += 1
             if done % 16 == 0:
-                _report(progress, done / total_pages, f"{100 * done // total_pages}%")
-    _report(progress, 1.0, "100%", end=True)
+                _report(progress, done / total_pages, f"reading page {done}/{total_pages}")
+    _report(progress, 1.0, f"reading page {total_pages}/{total_pages}", end=True)
     return bytes(pcm)
 
 
@@ -475,13 +483,16 @@ def upload_loop(lp: Looper, pcm: bytes, progress=True):
     # The erase command answers OK but does nothing on this firmware, so only blocks
     # that are already erased (all FF) can be programmed cleanly. Reserve all of them
     # before writing anything, so a too-long file fails without wasting blocks.
+    checked = [0]
+
     def next_empty():
+        # (no erase here: this firmware ignores it, it would only cost a round trip)
         while candidates:
             blk = candidates.pop(0)
-            try:
-                lp.erase_block(AREA_NAND, blk * BLOCK_SIZE)
-            except DeviceError:
-                pass  # a refused erase is fine: the emptiness check decides
+            checked[0] += 1
+            if checked[0] % 10 == 0:
+                _report(progress, 0.15 * len(reserve) / nblocks,
+                        f"searching empty memory: {len(reserve)}/{nblocks} found, {checked[0]} blocks checked")
             if lp.block_is_erased(blk):
                 return blk
         return None
@@ -495,7 +506,8 @@ def upload_loop(lp: Looper, pcm: bytes, progress=True):
                 f"not enough empty memory: need {nblocks} blocks ({len(pcm) / SAMPLE_WIDTH / SAMPLE_RATE:.1f} s), "
                 f"found {len(reserve)} (~{len(reserve) * per_block_s:.0f} s). Nothing was written.")
         reserve.append(blk)
-        _report(progress, 0.1 * (n + 1) / nblocks, f"finding empty memory: {n + 1}/{nblocks} blocks",
+        _report(progress, 0.15 * (n + 1) / nblocks,
+                f"searching empty memory: {n + 1}/{nblocks} found, {checked[0]} blocks checked",
                 end=n + 1 == nblocks)
 
     blocks = []
@@ -524,8 +536,8 @@ def upload_loop(lp: Looper, pcm: bytes, progress=True):
             continue
         blocks.append(blk)
         pos += len(block_pcm)
-        _report(progress, 0.1 + 0.9 * pos / len(pcm),
-                f"writing: {100 * pos // len(pcm)}%  (block {len(blocks)}/{nblocks})", end=pos >= len(pcm))
+        _report(progress, 0.15 + 0.85 * pos / len(pcm),
+                f"writing block {len(blocks)}/{nblocks}", end=pos >= len(pcm))
 
     rec = build_record(len(pcm), blocks)
     lp.write(AREA_NAND, INDEX_BLOCK * BLOCK_SIZE + slot * PAGE_SIZE, rec)
@@ -784,7 +796,7 @@ def count_space(lp: Looper, progress=True):
         if blk not in used and lp.block_is_erased(blk):
             free += 1
         if blk % 20 == 0:
-            _report(progress, blk / INDEX_BLOCK, f"scanning block {blk}/{INDEX_BLOCK}, {free} empty so far")
+            _report(progress, blk / INDEX_BLOCK, f"scanning block {blk}/{INDEX_BLOCK}, {free} empty")
     _report(progress, 1.0, f"scanned {INDEX_BLOCK} blocks, {free} empty", end=True)
     slots = 0
     base = INDEX_BLOCK * BLOCK_SIZE
