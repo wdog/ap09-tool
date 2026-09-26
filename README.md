@@ -144,6 +144,22 @@ Colours are used on a terminal; set `NO_COLOR=1` to turn them off.
 
 
 
+### How much space is left
+
+```
+python3 ap09.py space          # full scan, ~4 min
+```
+
+```
+free    162 blocks  ~151 s of audio
+max     151 s per upload (pedal limit 10 min)
+slots   29 free in the index (upload/select/clear use 1)
+```
+
+`upload` checks by itself too. It first reserves all the empty blocks it needs, and if
+they are not enough it stops **without writing anything** (`not enough empty memory:
+need N blocks …, found M`). If the index is full it stops before writing as well.
+
 ### Bring back an older loop
 
 ```

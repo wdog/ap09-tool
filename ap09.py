@@ -423,23 +423,41 @@ def upload_loop(lp: Looper, pcm: bytes, progress=True):
     order = list(range(start, INDEX_BLOCK)) + list(range(0, start))
     candidates = [b for b in order if b not in used]
 
+    # The erase command answers OK but does nothing on this firmware, so only blocks
+    # that are already erased (all FF) can be programmed cleanly. Reserve all of them
+    # before writing anything, so a too-long file fails without wasting blocks.
+    def next_empty():
+        while candidates:
+            blk = candidates.pop(0)
+            try:
+                lp.erase_block(AREA_NAND, blk * BLOCK_SIZE)
+            except DeviceError:
+                pass  # a refused erase is fine: the emptiness check decides
+            if lp.block_is_erased(blk):
+                return blk
+        return None
+
+    reserve = []
+    for n in range(nblocks):
+        blk = next_empty()
+        if blk is None:
+            per_block_s = per_block / SAMPLE_WIDTH / SAMPLE_RATE
+            raise DeviceError(
+                f"not enough empty memory: need {nblocks} blocks ({len(pcm) / SAMPLE_WIDTH / SAMPLE_RATE:.1f} s), "
+                f"found {len(reserve)} (~{len(reserve) * per_block_s:.0f} s). Nothing was written.")
+        reserve.append(blk)
+        if progress:
+            print(f"\r  finding empty memory: {n + 1}/{nblocks} blocks", end="", file=sys.stderr, flush=True)
+    if progress:
+        print(file=sys.stderr)
+
     blocks = []
     pos = 0
-    checked = 0
     while pos < len(pcm):
-        if not candidates:
-            raise DeviceError("not enough erased NAND blocks for this audio")
-        blk = candidates.pop(0)
+        blk = reserve.pop(0) if reserve else next_empty()
+        if blk is None:
+            raise DeviceError("ran out of empty memory while replacing blocks that failed verification")
         addr = blk * BLOCK_SIZE
-        checked += 1
-        # The erase command answers OK but does nothing on this firmware, so only
-        # blocks that are already erased (all FF) can be programmed cleanly.
-        try:
-            lp.erase_block(AREA_NAND, addr)
-        except DeviceError:
-            pass  # a refused erase is fine: the emptiness check below decides
-        if not lp.block_is_erased(blk):
-            continue
         bi = len(blocks)
         image = bytearray(b"\xff" * BLOCK_SIZE)
         block_pcm = pcm[pos:pos + per_block]
@@ -460,8 +478,8 @@ def upload_loop(lp: Looper, pcm: bytes, progress=True):
         blocks.append(blk)
         pos += len(block_pcm)
         if progress:
-            print(f"\r  {100 * pos // len(pcm)}%  (block {len(blocks)}/{nblocks}, "
-                  f"{checked - len(blocks)} non-empty skipped)", end="", file=sys.stderr, flush=True)
+            print(f"\r  writing: {100 * pos // len(pcm)}%  (block {len(blocks)}/{nblocks})",
+                  end="", file=sys.stderr, flush=True)
     if progress:
         print(file=sys.stderr)
 
@@ -673,9 +691,12 @@ def cmd_space(lp, args):
     for slot in range(first, PAGES_PER_BLOCK - 1, 2):
         if lp.checksum(AREA_NAND, base + slot * PAGE_SIZE, RECORD_SIZE) == (0xFF * RECORD_SIZE) & 0xFFFF:
             slots += 1
-    print(f"empty blocks: {free} -> max upload {min(free, MAX_BLOCKS) * per_block_s:.0f} s "
-          f"({free * per_block_s:.0f} s in total)")
-    print(f"free index slots: {slots} (each upload or select uses one)")
+    total_s = free * per_block_s
+    max_s = min(free, MAX_BLOCKS) * per_block_s
+    col = "32" if free > 60 else "33" if free > 10 else "31"
+    print(f"{_color('1', 'free   ')} {_color(col, f'{free} blocks  ~{total_s:.0f} s of audio')}")
+    print(f"{_color('1', 'max    ')} {max_s:.0f} s per upload (pedal limit {MAX_BLOCKS * per_block_s / 60:.0f} min)")
+    print(f"{_color('1', 'slots  ')} {_color('32' if slots > 3 else '31', str(slots))} free in the index (upload/select/clear use 1)")
 
 
 def cmd_probe(lp, args):
