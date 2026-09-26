@@ -493,16 +493,27 @@ def write_wav(path: str, pcm: bytes, rate=SAMPLE_RATE):
 # ---------------------------------------------------------------- CLI
 
 def cmd_info(lp, args):
-    print("device info:", lp.info().hex(" "))
+    info = lp.info()
     model = int.from_bytes(lp.read(AREA_MCU, 0x2180, 16)[4:8], "little")
-    print(f"model id: 0x{model:04x}" + (" (NANO LOOPER)" if model == 0x2715 else " (not a NANO LOOPER!)"))
     loop = current_loop(lp)
-    if not loop:
-        print("no loop stored")
-        return
-    secs = loop["length"] / SAMPLE_WIDTH / SAMPLE_RATE
-    print(f"loop: {secs:.2f} s, {loop['length']} bytes, {len(loop['blocks'])} blocks "
-          f"(first {loop['blocks'][0]}), index record #{loop['seq']:#x} at +{loop['offset']:#x}")
+    ok = model == 0x2715
+    rows = [
+        ("device", f"{VID:04x}:{PID:04x}  bus {lp.dev.bus} addr {lp.dev.address}", None),
+        ("model", f"0x{model:04x} " + ("NANO LOOPER" if ok else "unknown"), "32" if ok else "31"),
+        ("info", info[:16].decode("ascii", "replace") + " " + info[16:].hex(" "), "2"),
+        ("format", f"mono  24-bit  {SAMPLE_RATE} Hz", None),
+    ]
+    if loop:
+        secs = loop["length"] / SAMPLE_WIDTH / SAMPLE_RATE
+        rows += [
+            ("loop", f"▶ {secs:.2f} s", "1;32"),
+            ("size", f"{loop['length']} B  {len(loop['blocks'])} blocks  first {loop['blocks'][0]}", None),
+            ("index", f"record @ +{loop['offset']:#x}  seq {loop['seq']:#x}", "2"),
+        ]
+    else:
+        rows.append(("loop", "■ none", "1;31"))
+    for key, val, color in rows:
+        print(f"{_color('1', f'{key:<7}')} {_color(color, val) if color else val}")
 
 
 def _color(code: str, text: str) -> str:

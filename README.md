@@ -33,9 +33,13 @@ sudo python3 ap09.py info
 ```
 
 ```
-device info: 61 62 63 64 ...
-model id: 0x2715 (NANO LOOPER)
-loop: 19.91 s, 2799858 bytes, 22 blocks (first 1661), index record #0x696 at +0xc000
+device  0416:5555  bus 3 addr 16
+model   0x2715 NANO LOOPER
+info    abcdefghabcdefgh 01 00 05 12 13 14 15 16 17 18 19
+format  mono  24-bit  46875 Hz
+loop    ▶ 19.91 s
+size    2799858 B  22 blocks  first 1661
+index   record @ +0xc000  seq 0x696
 ```
 
 ### List the loops
