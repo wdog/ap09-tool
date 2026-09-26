@@ -111,24 +111,26 @@ power-on the pedal rewrites its index and the history disappears.
 ### What `list` shows
 
 ```
-┌───────────────────────────────────────────────────────────────────────────┐
-│ Pedal: ▶ plays loop #3 (19.91 s)                                          │
-├───┬─────────┬──────────────────────────────────┬──────────────────────────┤
-│ # │ Length  │ Status                           │ Action                   │
-├───┼─────────┼──────────────────────────────────┼──────────────────────────┤
-│ 0 │ 13.93 s │ ● previous loop, still in memory │ select 0 / download -r 0 │
-│ 1 │ 7.94 s  │ ⚠ damaged (3/9 blocks reused)    │ -                        │
-│ 2 │ 19.91 s │ ↺ duplicate of #3                │ -                        │
-│ 3 │ 19.91 s │ ▶ current loop (playing)         │ download -r 3            │
-└───┴─────────┴──────────────────────────────────┴──────────────────────────┘
+▶ playing #3  19.91 s
+
+ #    length  blocks  state
+ 0    13.93s      15  ● saved
+ 1     7.94s       9  ⚠ damaged 3/9
+ 2    19.91s      22  ↺ duplicate of #3
+ 3    19.91s      22  ▶ playing
 ```
 
-- ▶ the loop the pedal plays.
-- ● an older loop whose audio is still in memory. You can download it or make it
-  current again.
-- ⚠ an older loop that has been partly overwritten by a later one.
-- ↺ a duplicate record pointing to the same audio.
-- The title shows ■ when the pedal has no loop (empty or after `clear`).
+Colours are used on a terminal; set `NO_COLOR=1` to turn them off.
+
+| icon | state | meaning |
+|---|---|---|
+| ▶ | playing | the loop the pedal plays |
+| ● | saved | older loop, audio still in memory: `download -r N` / `select N` |
+| ⚠ | damaged | older loop, N/M blocks overwritten by a later loop |
+| ↺ | duplicate | same audio as another entry |
+| ■ | no loop | pedal empty or cleared |
+
+The history (●) is lost when the pedal restarts.
 
 ### Bring back an older loop
 
