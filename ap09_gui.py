@@ -4,6 +4,9 @@ ap09-gui: GTK4 / libadwaita front end for ap09.py (Ammoon AP-09 nano looper).
 
 All pedal I/O runs on one background worker thread (the pedal only handles one
 client at a time); the UI is updated through GLib.idle_add.
+
+Copyright (c) 2026 wdog <wdog666@gmail.com>
+SPDX-License-Identifier: MIT  (see LICENSE; keep this notice in copies and derivatives)
 """
 
 import hashlib
@@ -572,6 +575,7 @@ class LooperWindow(Adw.ApplicationWindow):
                 restore.add_css_class("pill")
                 restore.connect("clicked", lambda *_, i=i, r=r: self.confirm_select(i, r))
                 row.add_suffix(restore)
+                row.add_suffix(icon_button("user-trash-symbolic", "Delete from the list", self.confirm_delete, i, r))
             self.history_list.append(row)
 
     def _register_wave(self, loop, wave):
@@ -833,13 +837,24 @@ class LooperWindow(Adw.ApplicationWindow):
             lambda lp, p: ap09.select_loop(lp, r), f"Loop #{i} is on the pedal. Replug it to load."))
         dlg.present(self)
 
+    def confirm_delete(self, i, r):
+        dlg = Adw.AlertDialog(heading=f"Delete loop #{i}?",
+                              body=f"{fmt_secs(loop_secs(r))}. It disappears from the list. The audio "
+                                   "cannot be wiped over USB and is overwritten when the memory is needed.")
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("delete", "Delete")
+        dlg.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.connect("response", lambda d, resp: resp == "delete" and self._run_simple(
+            lambda lp, p: ap09.delete_loop(lp, r), f"Loop #{i} deleted"))
+        dlg.present(self)
+
     def confirm_clear(self):
         if not any(r["current"] for r in self.records):
             self.toast("The pedal already has no loop")
             return
         dlg = Adw.AlertDialog(heading="Clear the pedal?",
-                              body="The pedal will have no loop. The audio stays in memory "
-                                   "and can be put back from the list.")
+                              body="The pedal will have no loop and the loop disappears from the list. "
+                                   "Its audio stays in memory until it is needed again.")
         dlg.add_response("cancel", "Cancel")
         dlg.add_response("clear", "Clear")
         dlg.set_response_appearance("clear", Adw.ResponseAppearance.DESTRUCTIVE)
@@ -916,11 +931,14 @@ class LooperWindow(Adw.ApplicationWindow):
         about = Adw.AboutDialog(
             application_name="AP-09 Looper",
             application_icon="audio-x-generic",
-            developer_name="ap09",
-            version="0.3",
+            developer_name="wdog",
+            developers=["wdog <wdog666@gmail.com>"],
+            copyright="© 2026 wdog",
+            version=ap09.__version__,
             comments="Download, preview and upload loops on the Ammoon AP-09 nano looper.\n"
                      "Protocol reverse-engineered from the official Windows tool.",
-            license_type=Gtk.License.UNKNOWN)
+            support_url="mailto:wdog666@gmail.com",
+            license_type=Gtk.License.MIT_X11)
         about.present(self)
 
     def _on_key(self, ctrl, keyval, keycode, state):

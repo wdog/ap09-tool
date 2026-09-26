@@ -160,9 +160,21 @@ ffmpeg -i song.mp3 -ac 1 -ar 46875 -c:a pcm_s24le song-ap09.wav
 python3 ap09.py clear          # asks for confirmation; -y to skip it
 ```
 
-The pedal ends up with no loop. The audio cannot be wiped over USB. The old loop
-stays in `list` as history (● saved) and `select` can bring it back. The history goes
-away only when the pedal compacts its index (see Upload status).
+The pedal ends up with no loop, and that loop **disappears from `list`**. The clear
+record names the loop it removes, the same way the pedal's own clear records do.
+
+### Delete a loop from the list
+
+```
+python3 ap09.py delete 2       # asks for confirmation; -y to skip it
+python3 ap09.py list --all     # also shows deleted loops (✖)
+python3 ap09.py select --all 3 # bring a deleted loop back (number from list --all)
+```
+
+The audio cannot be wiped over USB (the erase command is ignored). It stays in memory
+until it gets reused, and `delete` only hides it. Deleting the playing loop is the same
+as `clear`. Deleting an old loop uses 2 index slots, because the playing loop is
+re-selected right after (the pedal only looks at the newest record).
 
 ### What `list` shows
 
@@ -189,6 +201,7 @@ Colours are used on a terminal; set `NO_COLOR=1` to turn them off.
 | ▶ | playing | the loop the pedal plays |
 | ● | saved | older loop, audio still in memory: `download -r N` / `select N` |
 | ⚠ | damaged | older loop, N/M blocks overwritten by a later loop |
+| ✖ | deleted | removed with `clear`/`delete` (only with `list --all`) |
 | ■ | no loop | pedal empty or cleared |
 
 
@@ -443,6 +456,7 @@ the loop**. That one is rotated by one page: chunk 0 → page 63, chunk k → pa
 
 ### Files
 
+- `LICENSE` — MIT, © 2026 wdog.
 - `ap09.py` — CLI and core library (transport, protocol, index parsing, download, upload, select, clear, space).
 - `ap09_gui.py` — GTK4/libadwaita app built on `ap09.py`.
 - `ap09-gui.desktop` — launcher template (`@DIR@` = project folder).
@@ -450,3 +464,18 @@ the loop**. That one is rotated by one page: chunk 0 → page 63, chunk k → pa
 - `PROTOCOL.md` — early notes, now **superseded by this README**.
 - `backup-original-loop.wav` — backup of the loop that was on the pedal.
 - `re/` (not in git) — `Looper Software.exe` from the official installer and its `objdump -d` output (`looper_disasm.txt`).
+
+---
+
+## Author and license
+
+**wdog** — <wdog666@gmail.com>
+
+Released under the [MIT License](LICENSE): you may use, copy, modify, improve and
+redistribute this software, provided that **the copyright notice with the author's name
+(`Copyright (c) 2026 wdog <wdog666@gmail.com>`) and the license text are kept** in all
+copies and derivative works.
+
+Not affiliated with Ammoon or Rowin. The protocol was reverse-engineered for
+interoperability; use at your own risk.
+

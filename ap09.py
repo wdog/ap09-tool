@@ -3,7 +3,14 @@
 ap09: import/export loops on the Ammoon AP-09 nano looper (Rowin OEM, USB 0416:5555).
 
 See README.md for usage and for the reverse-engineered protocol.
+
+Copyright (c) 2026 wdog <wdog666@gmail.com>
+SPDX-License-Identifier: MIT  (see LICENSE; keep this notice in copies and derivatives)
 """
+
+__author__ = "wdog <wdog666@gmail.com>"
+__license__ = "MIT"
+__version__ = "0.3"
 
 import argparse
 import struct
@@ -247,9 +254,19 @@ def record_length(rec: bytes) -> int:
     return (pages_hi * PAGES_PER_BLOCK + pages_lo) * PAGE_AUDIO + (tail + 1) * TAIL_UNIT
 
 
-def parse_record(rec: bytes):
-    """Decode one 'looper' index record (needs the full block list). None if not valid."""
-    if rec[:7] != b"looper\x00" or rec[8] == 0:
+def has_loop_fields(rec: bytes) -> bool:
+    """True if the record carries a loop description (length/blocks). Clear records written
+    by this tool do (they name the loop being removed); legacy/pedal ones may be all FF."""
+    return rec[:7] == b"looper\x00" and rec[12:16] != b"\xff" * 4 and \
+        rec[RECORD_HEAD:RECORD_HEAD + 2] not in (b"\xff\xff", b"\x00\x00")
+
+
+def parse_record(rec: bytes, allow_cleared=False):
+    """Decode one 'looper' index record (needs the full block list). None if not valid.
+    With allow_cleared, a clear record that names a loop is decoded too."""
+    if rec[:7] != b"looper\x00":
+        return None
+    if rec[8] == 0 and not (allow_cleared and has_loop_fields(rec)):
         return None
     length = record_length(rec)
     nblocks = -(-length // (PAGE_AUDIO * PAGES_PER_BLOCK))
@@ -280,12 +297,13 @@ def read_index(lp: Looper):
             continue
         last_off = off
         rec = head
-        if head[8]:
+        if head[8] or has_loop_fields(head):
             need = RECORD_HEAD + 2 * -(-record_length(head) // (PAGE_AUDIO * PAGES_PER_BLOCK))
             if need > len(head):
                 rec = head + lp.read(AREA_NAND, base + off + len(head), min(need, RECORD_SIZE) - len(head))
-        r = parse_record(rec) or {}
-        r.update(offset=off, valid=bool(r))
+        valid = bool(head[8])
+        r = parse_record(rec, allow_cleared=True) or {}
+        r.update(offset=off, valid=valid and bool(r))
         recs.append(r)
     return recs, last_off
 
@@ -293,39 +311,48 @@ def read_index(lp: Looper):
 def scan_index(lp: Looper):
     """Returns (current_loop_or_None, last_offset_or_None, blocks referenced by any record)."""
     recs, last_off = read_index(lp)
-    used = set(b for r in recs if r["valid"] for b in r["blocks"])
+    used = set(b for r in recs if "blocks" in r for b in r["blocks"])
     current = recs[-1] if recs and recs[-1]["valid"] else None
     return current, last_off, used
 
 
-def all_records(lp: Looper):
+def all_records(lp: Looper, include_deleted=False):
     """Distinct loops in the index, oldest first, one entry per audio.
 
-    The index is an append-only log, so 'select' adds a second record pointing at the same
-    audio. Records with the same length and blocks are merged here: each loop appears once,
-    with 'records' = how many index records point at it. 'current' marks the loop the pedal
-    plays (the newest record, unless that record clears the loop).
+    The index is an append-only log. Replaying it:
+      valid record        -> that loop becomes current (and is no longer deleted)
+      clear record naming a loop -> that loop is deleted (hidden from the list)
+      clear record without a loop (pedal / older tool) -> the loop current at that moment is deleted
+    Records pointing at the same audio (e.g. after 'select') are merged: each loop appears once.
+    'current' marks the loop the pedal plays; 'deleted' loops are dropped unless include_deleted.
     """
     raw, _ = read_index(lp)
-    newest = raw[-1] if raw and raw[-1]["valid"] else None
-    newest_key = (newest["length"], tuple(newest["blocks"])) if newest else None
-    loops = {}
+    loops, current, deleted = {}, None, set()
     for pos, r in enumerate(raw):
-        if not r["valid"]:
-            continue
-        key = (r["length"], tuple(r["blocks"]))
-        if key not in loops:
+        key = (r["length"], tuple(r["blocks"])) if "blocks" in r else None
+        if key and key not in loops:
             loops[key] = dict(r, first=pos, records=0)
-        loops[key]["records"] += 1
+        if key:
+            loops[key]["records"] += 1
+        if r["valid"]:
+            current = key
+            deleted.discard(key)
+        else:
+            target = key or current
+            if target:
+                deleted.add(target)
+            current = None
     recs = sorted(loops.values(), key=lambda r: r["first"])
     for r in recs:
-        r["current"] = (r["length"], tuple(r["blocks"])) == newest_key
+        k = (r["length"], tuple(r["blocks"]))
+        r["current"] = k == current
+        r["deleted"] = k in deleted
         r["same_as"] = None  # duplicates are merged, kept for callers that check it
         # Audio is written once, when the loop first appears; a different loop that shows
         # up later and uses one of its blocks has overwritten that part.
         later = set(b for x in recs if x["first"] > r["first"] for b in x["blocks"])
         r["overwritten"] = len(set(r["blocks"]) & later)
-    return recs
+    return recs if include_deleted else [r for r in recs if not r["deleted"]]
 
 
 def current_loop(lp: Looper):
@@ -568,11 +595,12 @@ STATES = {  # key: (icon, label, ANSI color, legend)
     "saved": ("●", "saved", "36", "old loop, not playing, audio still in memory -> select N / download -r N"),
     "damaged": ("⚠", "damaged", "33", "old loop, N/M blocks overwritten by a later one"),
     "dup": ("↺", "duplicate", "2", "same audio as another entry"),
+    "deleted": ("✖", "deleted", "2", "removed with clear/delete; audio may still be in memory -> select N"),
 }
 
 
 def cmd_list(lp, args):
-    recs = all_records(lp)
+    recs = all_records(lp, include_deleted=args.all)
     current = next((i for i, r in enumerate(recs) if r["current"]), None)
     if current is None:
         print(_color("1;31", "■ no loop"))
@@ -588,6 +616,8 @@ def cmd_list(lp, args):
         secs = r["length"] / SAMPLE_WIDTH / SAMPLE_RATE
         if r["current"]:
             key, extra = "playing", ""
+        elif r["deleted"]:
+            key, extra = "deleted", ""
         elif r["same_as"] is not None:
             key, extra = "dup", f" of #{r['same_as']}"
         elif r["overwritten"]:
@@ -645,8 +675,24 @@ def cmd_upload(lp, args):
           file=sys.stderr)
 
 
-def cmd_select(lp, args):
+def cmd_delete(lp, args):
     recs = all_records(lp)
+    if not 0 <= args.record < len(recs):
+        raise DeviceError(f"no loop #{args.record} (see 'list')")
+    r = recs[args.record]
+    if not args.yes:
+        what = "the loop the pedal plays (the pedal will have no loop)" if r["current"] else "an old loop"
+        answer = input(f"delete loop #{args.record} ({r['length'] / SAMPLE_WIDTH / SAMPLE_RATE:.2f} s), {what}? [y/N] ")
+        if answer.strip().lower() not in ("y", "yes", "s", "si", "sì"):
+            print("aborted", file=sys.stderr)
+            return
+    delete_loop(lp, r)
+    print(f"loop #{args.record} deleted from the list (numbers shift; see 'list')."
+          + (" Unplug/replug the pedal." if r["current"] else ""), file=sys.stderr)
+
+
+def cmd_select(lp, args):
+    recs = all_records(lp, include_deleted=args.all)
     if not 0 <= args.record < len(recs):
         raise DeviceError(f"no record #{args.record} (see 'list')")
     r = recs[args.record]
@@ -677,18 +723,36 @@ def select_loop(lp: Looper, loop):
 
 
 def clear_loop(lp: Looper):
-    """Leave the pedal without a loop (audio stays in memory as history)."""
-    append_record(lp, build_clear_record())
+    """Leave the pedal without a loop. The removed loop is named in the clear record, so it
+    disappears from the list (its audio stays in memory until reused)."""
+    current = scan_index(lp)[0]
+    append_record(lp, build_clear_record(current))
     if scan_index(lp)[0] is not None:
         raise DeviceError("clear record did not take effect")
 
 
-def build_clear_record() -> bytes:
-    """Record with the valid flag at 0: the pedal then has no loop (it writes the same when
-    you clear the loop with the footswitch)."""
-    rec = bytearray(b"\xff" * RECORD_SIZE)
-    rec[0:7] = b"looper\x00"
-    rec[RECORD_SIZE - 8:RECORD_SIZE - 1] = b"looper\x00"
+def delete_loop(lp: Looper, loop):
+    """Hide a loop from the list. If it is the playing one this is clear_loop; otherwise a
+    clear record naming it is written and the playing loop is re-selected right after
+    (the pedal only looks at the newest record). Uses 1 or 2 index slots."""
+    current = scan_index(lp)[0]
+    if current and current["blocks"] == loop["blocks"] and current["length"] == loop["length"]:
+        clear_loop(lp)
+        return
+    append_record(lp, build_clear_record(loop))
+    if current:
+        append_record(lp, build_record(current["length"], current["blocks"]))
+
+
+def build_clear_record(loop=None) -> bytes:
+    """Record with the valid flag at 0: the pedal then has no loop. Like the pedal's own clear
+    records, it keeps the removed loop's length/blocks, which the list uses to hide it."""
+    if loop:
+        rec = bytearray(build_record(loop["length"], loop["blocks"]))
+    else:
+        rec = bytearray(b"\xff" * RECORD_SIZE)
+        rec[0:7] = b"looper\x00"
+        rec[RECORD_SIZE - 8:RECORD_SIZE - 1] = b"looper\x00"
     rec[8] = 0
     return bytes(rec)
 
@@ -762,7 +826,8 @@ def main():
     fmt = argparse.RawDescriptionHelpFormatter
     ap = argparse.ArgumentParser(
         prog="ap09.py", formatter_class=fmt,
-        description="Copy loops between an Ammoon AP-09 nano looper (USB 0416:5555) and this computer.",
+        description=f"Copy loops between an Ammoon AP-09 nano looper (USB 0416:5555) and this computer.\n"
+                    f"v{__version__} · by {__author__} · MIT license",
         epilog="""\
 typical use:
   ap09.py info                     what is on the pedal
@@ -793,6 +858,7 @@ point at the same audio, e.g. after 'select', are merged). The pedal plays only 
 one marked playing; the others usually still have their audio in memory and can be
 downloaded (download -r N) or made current again (select N).
 'damaged N/M': N of its M memory blocks were reused by a later loop. Read-only.""")
+    p.add_argument("-a", "--all", action="store_true", help="also show deleted loops (✖)")
     p.set_defaults(func=cmd_list)
 
     p = sub.add_parser(
@@ -843,13 +909,25 @@ partly overwritten, it will play partly corrupted. Uses one index slot.
 
 After select unplug and replug the pedal.""")
     p.add_argument("record", type=int, metavar="N", help="loop number from 'list'")
+    p.add_argument("-a", "--all", action="store_true", help="N is a number from 'list --all' (restore a deleted loop)")
     p.set_defaults(func=cmd_select)
+
+    p = sub.add_parser(
+        "delete", formatter_class=fmt, help="remove a loop from the list",
+        description="""\
+Remove loop #N (number from 'list') from the list. Deleting the playing loop is the
+same as 'clear'. The audio cannot be wiped over USB: it stays in memory until reused,
+and 'list --all' / 'select --all N' can still bring it back. Uses 1-2 index slots.""")
+    p.add_argument("record", type=int, metavar="N", help="loop number from 'list'")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    p.set_defaults(func=cmd_delete)
 
     p = sub.add_parser(
         "clear", formatter_class=fmt, help="leave the pedal without a loop",
         description="""\
-Remove the current loop, like clearing it on the pedal: a 'no loop' record is
-added to the index. Asks for confirmation unless -y is given.
+Remove the current loop, like clearing it on the pedal: a 'no loop' record naming
+it is added to the index, and it disappears from 'list' (see 'list --all').
+Asks for confirmation unless -y is given.
 
 limits: the audio itself cannot be wiped over USB (the erase command is ignored).
 Older loops stay in 'list' as history and can be brought back with 'select'
