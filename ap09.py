@@ -563,7 +563,7 @@ def cmd_list(lp, args):
         icon, label, color, legend = STATES[key]
         print(_color("2", f"{icon} {label:<9} {legend}"))
     if "saved" in seen:
-        print(_color("2", "  history is lost when the pedal restarts"))
+        print(_color("2", "  history stays until the pedal compacts its index (seen when the log was half full)"))
 
 
 def cmd_download(lp, args):
@@ -783,9 +783,9 @@ Remove the current loop, like clearing it on the pedal: a 'no loop' record is
 added to the index. Asks for confirmation unless -y is given.
 
 limits: the audio itself cannot be wiped over USB (the erase command is ignored).
-Until the pedal restarts, older loops stay in 'list' as history and can be
-brought back with 'select'; at power-on the pedal rewrites its index and the
-history disappears (the audio stays in memory until it gets reused).
+Older loops stay in 'list' as history and can be brought back with 'select'
+until the pedal compacts its index (observed once at power-on, when the index
+log was half full); the audio stays in memory until it gets reused.
 
 After clear unplug and replug the pedal.""")
     p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")

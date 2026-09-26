@@ -108,9 +108,9 @@ ffmpeg -i song.mp3 -ac 1 -ar 46875 -c:a pcm_s24le song-ap09.wav
 python3 ap09.py clear          # asks for confirmation; -y to skip it
 ```
 
-The pedal ends up with no loop. The audio cannot be wiped over USB. Until the next
-restart the old loop stays in `list` as history and `select` can bring it back. At
-power-on the pedal rewrites its index and the history disappears.
+The pedal ends up with no loop. The audio cannot be wiped over USB. The old loop
+stays in `list` as history (● saved) and `select` can bring it back. The history goes
+away only when the pedal compacts its index (see Upload status).
 
 ### What `list` shows
 
@@ -127,7 +127,7 @@ power-on the pedal rewrites its index and the history disappears.
 ● saved     old loop, not playing, audio still in memory -> select N / download -r N
 ⚠ damaged   old loop, N/M blocks overwritten by a later one
 ↺ duplicate same audio as another entry
-  history is lost when the pedal restarts
+  history stays until the pedal compacts its index (seen when the log was half full)
 ```
 
 The legend lists only the states that appear.
@@ -142,7 +142,7 @@ Colours are used on a terminal; set `NO_COLOR=1` to turn them off.
 | ↺ | duplicate | same audio as another entry |
 | ■ | no loop | pedal empty or cleared |
 
-The history (●) is lost when the pedal restarts.
+
 
 ### Bring back an older loop
 
@@ -218,10 +218,12 @@ The official tool erases blocks and then writes them. On this pedal **the erase 
 - Capacity = number of empty blocks. Measured on this unit: of the first 1024 blocks
   about 200 had an FF first page. In a test upload, 8 of 14 candidates were already
   used.
-- **Observed at power-on (once, after a `clear`):** the pedal erases the index
-  block itself and writes a single record with the current state. So its internal
-  erase works, the history in `list` disappears after every replug, and the index slots
-  become free again. The old audio blocks stay untouched.
+- **Index compaction by the pedal.** Once, at power-on, with the log filled up to
+  slot 32 of 64, the pedal erased the index block itself and wrote a single record
+  with the current state (`looper\0 ff <valid> ff 00 00`, block list zeroed). So its
+  internal erase works, and compaction frees the slots and wipes the history. A later
+  restart with only 3 records **did not** compact, so the trigger is probably the fill
+  level, not the restart itself (unconfirmed). The old audio blocks stay untouched.
 - The index block cannot be erased over USB. It has 32 record slots (the unit had 15 used, then
   17). When it is full, upload/select stop with "loop index block is full; record any loop
   on the pedal once". Assumption (untested): the pedal erases or rotates its own index
