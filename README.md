@@ -1,13 +1,17 @@
 # ap09 — Ammoon AP-09 nano looper on Linux
 
-A command-line tool to copy the loop stored on an **Ammoon AP-09 nano looper**
-(USB ID `0416:5555`, Rowin OEM chip) to your computer over USB.
+A command-line tool to copy loops between an **Ammoon AP-09 nano looper**
+(USB ID `0416:5555`, Rowin OEM chip) and your computer over USB.
 
 | Feature | Status |
 |---|---|
 | Download the loop → WAV | ✅ works, verified bit-exact |
+| List / download older loops | ✅ works |
 | Show device/loop info | ✅ works |
-| Upload WAV/MP3 → pedal | ⚠️ not working yet (see [Upload status](#upload-status)) |
+| Upload WAV/MP3/… → pedal | ✅ bit-exact over USB — ⚠️ playback on the pedal not yet confirmed (see [Upload status](#2-upload-status)) |
+| Make an older loop current (`select`) | ✅ writes the index record; playback not yet confirmed |
+
+Versions: tag `v0.1-download` = download only. Branch `upload` = download + upload.
 
 ---
 
@@ -16,7 +20,7 @@ A command-line tool to copy the loop stored on an **Ammoon AP-09 nano looper**
 ### Requirements
 
 ```
-sudo apt install python3-usb ffmpeg     # ffmpeg is only needed for upload conversion
+sudo apt install python3-usb ffmpeg     # ffmpeg only needed to upload non-native audio
 ```
 
 Plug the pedal into the computer with its USB cable. It does not need to be switched to
@@ -69,15 +73,41 @@ ffmpeg -i myloop.wav -ar 48000 myloop-48k.wav      # resample to 48 kHz
 ffmpeg -i myloop.wav -b:a 320k myloop.mp3          # mp3
 ```
 
-### Upload (not working yet)
+### Upload a loop
 
 ```
-sudo python3 ap09.py upload song.mp3 --experimental     # DON'T, see below
+sudo python3 ap09.py upload song.mp3
 ```
 
-When it works, the input can be any format ffmpeg reads (wav, mp3, flac, …). It gets
-converted automatically to mono, 24-bit, 46875 Hz. A WAV that is already in that
-format goes up as is. The maximum length is about 10 minutes (650 NAND blocks).
+Then **unplug and replug** the pedal so it loads the new loop.
+
+- The input can be anything ffmpeg reads (wav, mp3, flac, ogg, …). It is converted
+  automatically to the pedal's format: **mono, 24-bit, 46875 Hz**. A WAV that is already
+  in that format is sent as is, without ffmpeg.
+- Stereo is mixed down to mono. The end is padded with silence to a multiple of 62
+  samples (1.3 ms).
+- Maximum length is about 10 minutes (650 blocks). In practice the limit is how many
+  **empty** memory blocks the pedal has (see [Upload status](#2-upload-status)).
+- The upload replaces the current loop. The old loop is not deleted: it stays in `list`,
+  and you can bring it back with `select`.
+- Speed: about 1 s per second of audio.
+
+To produce the exact format yourself:
+
+```
+ffmpeg -i song.mp3 -ac 1 -ar 46875 -c:a pcm_s24le song-ap09.wav
+```
+
+### Bring back an older loop
+
+```
+sudo python3 ap09.py list
+sudo python3 ap09.py select 8        # loop #8 becomes the current one again
+```
+
+Unplug and replug afterwards. `select` does not copy any audio: it only adds an index
+record that points at the old loop's memory blocks. That only works while those blocks
+have not been reused (`list` tells you).
 
 ### Running without sudo
 
@@ -103,9 +133,15 @@ was developed.
 
 ## 2. Upload status
 
-Upload is implemented the same way as the official Windows tool (erase blocks, write pages,
-append an index record), but on this pedal **the erase command (0x21) replies "OK" and
-does not erase anything**. Tests:
+**Works over USB, verified bit-exact** (upload a 5 s tone, download it again: identical).
+**Not yet confirmed:** that the pedal plays an uploaded loop after a replug. If it does not,
+the first suspects are record byte 0x07 and the sequence number at 0x0A, which the
+official tool leaves as 0xFF / 0 while the pedal fills them in (see the index section).
+
+### Why the upload works differently from the official tool
+
+The official tool erases blocks and then writes them. On this pedal **the erase command
+(0x21) replies "OK" and does not erase anything**. Tests:
 
 - Erasing a block that holds data, then reading it back (same session, pages never read
   before, even after the 0x11 handshake) shows the old data is still there.
@@ -113,19 +149,41 @@ does not erase anything**. Tests:
   data comes out **ANDed** with the old, which is typical NAND behaviour when you program
   without erasing first.
 
-So an upload only comes out clean if every chosen block is already erased (`FF`). The next
-step is to understand why erase does nothing. Possible causes: a missing "unlock/begin"
-command, a different address unit, erase available only in some device state, or a
-different erase command in the newer firmware. The official tool also sends 0x24
-(checksum) after every write. Candidate workaround: pick only blocks whose pages
-all read as `FF`. That can be checked with 0x24, or by reading, which is slower.
+- Also tried, none of which erases: address as block number, page number, `addr>>9`,
+  `>>10`, `>>12`, `>>16`; blocks above and below 1536; erase immediately followed by a
+  write (to rule out a lazy erase).
 
-What went wrong during development, and how it was fixed: a test upload replaced the
-current loop with a corrupted tone. The original loop was never erased (erase does
-nothing), so it was brought back by appending an index record that points at its old
-blocks again (see `/tmp/restore.py` in the dev history, or `build_record()` +
-`Looper.write()`). The restore was verified bit-exact against the backup. Writing index
-records works.
+**Workaround used by `ap09.py upload`** (`upload_loop()`):
+
+1. Walk the blocks in the same order as the official tool (random start, going up,
+   wrapping) and skip blocks referenced by any record in the index.
+2. Still send erase (harmless, and useful if some firmware honours it). Then use the block
+   only if it is **really empty**: device checksum 0x24 over 0x1FFFF bytes == `0xFF01`
+   (all FF) and the first 16 bytes read as FF. Otherwise skip it. Checking one block takes
+   about 0.1 s.
+3. Write the pages (0x22), then verify the whole block with 0x24 against the expected
+   image (data plus FF for the spare bytes and unused pages). On a mismatch, mark the
+   block as used and take another one.
+4. Write the index record into the next **empty** 2-page slot of the index block (checked
+   the same way) and read it back.
+
+**Limits that follow from this:**
+
+- Capacity = number of empty blocks. Measured on this unit: of the first 1024 blocks
+  about 200 had an FF first page. In a test upload, 8 of 14 candidates were already
+  used.
+- The index block cannot be erased. It has 32 record slots (the unit had 15 used, then
+  17). When it is full, upload/select stop with "loop index block is full; record any loop
+  on the pedal once". Assumption (untested): the pedal erases or rotates its own index
+  when it needs to.
+
+### Development history
+
+A first upload (erase + write, like the official tool) produced a corrupted loop, because
+the new data got ANDed with the old. The original loop was still intact (erase does
+nothing), so it was restored by appending a record that points at its old blocks. That is
+what `select` does now. The restore was verified bit-exact against
+`backup-original-loop.wav`.
 
 ---
 
@@ -181,8 +239,8 @@ error (for example `00 59 00 01 00 00 01 FE` is error 1).
 | `0x11` info | – | 27 bytes (`"abcdefgh" "abcdefgh" 01 00 05 12..19`), static | `0x4189e0` | ✅ |
 | `0x23` read | `area:u8 addr:LE32 len:LE24` | echo of the 8-byte body, then `len` bytes | `0x418f80` | ✅ |
 | `0x22` write | `area addr:LE32 len:LE24 data` (≤0x1400 per packet) | status | `0x418c60` | ✅ (programs only, needs FF) |
-| `0x21` erase | `area addr:LE32` | status (OK) | `0x4191b0` / `0x418bc0` | ❌ no effect |
-| `0x24` checksum | `area addr:LE32 len:LE32` | echo + `u16` sum of the bytes | `0x419220` / `0x418ea0` | ✅ |
+| `0x21` erase | `area addr:LE32` | status (always OK) | `0x4191b0` / `0x418bc0` | ❌ no effect on this firmware |
+| `0x24` checksum | `area addr:LE32 len:LE32` | reply cmd 0x24: echo of the 9-byte body + `u16` LE sum of the bytes | `0x419220` / `0x418ea0` | ✅ (~0.1 s per 128 KiB) |
 
 Read chunks are capped at 0x3F1 bytes (the official tool's limit), writes at 0x1400.
 Areas: **0** = MCU internal flash (firmware, settings; never write here), **1** = 256 MiB
@@ -251,16 +309,22 @@ the loop**. That one is rotated by one page: chunk 0 → page 63, chunk k → pa
 
 ### Where to continue
 
-- **Fix erase.** Capture what the pedal expects. Look at other `0x21` users in the exe
-  (`grep -n "0x48ea78"` on the disassembly lists every packet builder: `0x407470`,
-  `0x407d1a`, `0x408e16`, `0x4189ee`, `0x418cd8`, `0x41900f`, `0x4191b0`, `0x419220`) and
-  check for a mode or unlock command sent before uploads.
-- Meaning of the info (0x11) bytes and of record byte 0x07.
-- Whether the pedal has to be power-cycled to see a new index record.
+- **Confirm playback** of an uploaded loop on the pedal. If it fails, try writing record
+  byte 0x07 and the sequence number (0x0A) the way the pedal does. Byte 0x07 is not a
+  simple sum/xor of the record (checked by brute force over all ranges).
+- **Make erase work** (it would lift the empty-block limit). Every packet builder in the
+  exe starts by loading the `00 59` header (`grep -n "0x48ea78"` on the disassembly):
+  `0x407470` read, `0x407d1a` erase (index), `0x408e16` erase (old song type), `0x4189ee`
+  info, `0x418cd8` write, `0x41900f` read, `0x4191b0` erase, `0x419220` checksum. There
+  is no other command, so erase is probably disabled in this firmware version, or allowed
+  only in a device state not reached yet (for example with the pedal stopped or in a
+  special mode).
+- Meaning of the info (0x11) bytes.
+- Command to count the empty blocks (a full scan takes about 4 min at 0.1 s per block).
 
 ### Files
 
-- `ap09.py` — the tool (transport, protocol, index parsing, download, upload).
+- `ap09.py` — the tool (transport, protocol, index parsing, download, upload, select).
 - `PROTOCOL.md` — early notes, now **superseded by this README**.
 - `backup-original-loop.wav` — backup of the loop that was on the pedal.
 - `re/` (not in git) — `Looper Software.exe` from the official installer and its `objdump -d` output (`looper_disasm.txt`).
