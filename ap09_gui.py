@@ -1205,8 +1205,8 @@ class LooperWindow(Adw.ApplicationWindow):
             self.space = result
             free, slots = result
             secs = free * ap09.PER_BLOCK_S
-            self.space_label.set_label(f"{free} empty blocks · ~{fmt_secs(secs)} of audio · "
-                                       f"{slots} index slots left")
+            self.space_label.set_label(f"{free} free blocks · ~{int(secs // 60)}:{int(secs % 60):02d} of audio")
+            self.space_label.set_tooltip_text(f"{slots} index slots left (upload/select/clear use 1)")
             self.space_level.set_visible(True)
             self.space_level.set_value(min(1.0, free / ap09.MAX_BLOCKS))
 

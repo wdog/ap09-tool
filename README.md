@@ -20,6 +20,30 @@ was written from scratch.
 
 ---
 
+## Features
+
+| | Status |
+|---|---|
+| Download the current loop → WAV | ✅ verified bit-exact |
+| List and download older loops still in memory | ✅ |
+| Listen to any loop on the computer | ✅ |
+| Upload WAV / MP3 / FLAC / … → pedal | ✅ bit-exact over USB · ⚠️ playback on the pedal not yet confirmed ([why](docs/PROTOCOL.md#upload-status)) |
+| Cut the file before upload: start/end, or BPM × bars for a loop exactly in time | ✅ |
+| Make an older loop play again (`select`) | ✅ |
+| Delete loops from the list, clear the pedal | ✅ |
+| Free space scan, device info | ✅ |
+| Graphical app: waveforms, drag & drop upload, compact sidebar layout | ✅ |
+
+![main window: sidebar, loop on the pedal, loops in memory, player](docs/gui-main.png)
+
+| Narrow window, sidebar open | Upload preview with cut |
+|---|---|
+| ![narrow window](docs/gui-narrow.png) | ![upload preview](docs/gui-upload.png) |
+| **About** | |
+| ![about](docs/gui-about.png) | |
+
+---
+
 ## Why this exists
 
 In November 2017 I wanted to get my loops off an Ammoon AP-09 on Linux. The only
@@ -48,27 +72,6 @@ layout and the loop index, tested every step live on the pedal, and wrote a new 
 that. The details are in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 > Issue #1 stays the starting point: if you arrive here from it, **this is the answer**.
-
----
-
-## Features
-
-| | Status |
-|---|---|
-| Download the current loop → WAV | ✅ verified bit-exact |
-| List and download older loops still in memory | ✅ |
-| Listen to any loop on the computer | ✅ |
-| Upload WAV / MP3 / FLAC / … → pedal | ✅ bit-exact over USB · ⚠️ playback on the pedal not yet confirmed ([why](docs/PROTOCOL.md#upload-status)) |
-| Make an older loop play again (`select`) | ✅ |
-| Delete loops from the list, clear the pedal | ✅ |
-| Free space scan, device info | ✅ |
-| Graphical app with waveforms, drag & drop upload | ✅ |
-
-| Main window | Loops (deleted shown) |
-|---|---|
-| ![main window](docs/gui-main.png) | ![loop list](docs/gui-loops.png) |
-| **Upload preview** | **About** |
-| ![upload preview](docs/gui-upload.png) | ![about](docs/gui-about.png) |
 
 ---
 
