@@ -50,6 +50,8 @@ What it does:
   💾 save as WAV, ✖ clear.
 - **Upload**: drag an audio file onto the window, or click the drop zone / **Upload**
   (Ctrl+O). A preview with the waveform and length comes first, then a confirmation.
+  There you can **cut** the file: set start/end (or click the waveform), or give a BPM and
+  a number of bars so the loop is exactly that long; ▶ plays the cut looped.
   Progress shows under the header bar.
 - **Loops in memory**: every older loop with a state badge (in memory / damaged),
   a small waveform, ▶ play, 💾 save, and **Put on pedal** (`select`).
@@ -162,6 +164,17 @@ sudo python3 ap09.py upload song.mp3
 ```
 
 Then **unplug and replug** the pedal so it loads the new loop.
+
+Cut the file first, to the exact sample, for a loop that is precisely in time
+(times are seconds or `m:ss.mmm`):
+
+```
+sudo python3 ap09.py upload song.wav --start 1:02.345 --end 1:10.345
+sudo python3 ap09.py upload song.wav --start 3.21 --length 8
+sudo python3 ap09.py upload song.wav --start 3.21 --bpm 120 --bars 4    # 4 bars of 4/4 = 8.000 s
+```
+
+`--beats N` changes the beats per bar (default 4).
 
 - The input can be anything ffmpeg reads (wav, mp3, flac, ogg, …). It is converted
   automatically to the pedal's format: **mono, 24-bit, 46875 Hz**. A WAV that is already

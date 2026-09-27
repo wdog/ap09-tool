@@ -440,6 +440,40 @@ def load_audio(path: str) -> bytes:
     return out.stdout
 
 
+def parse_time(text: str) -> float:
+    """'12.5', '1:02.345', '0:00:07' -> seconds."""
+    try:
+        secs = 0.0
+        for part in text.strip().split(":"):
+            secs = secs * 60 + float(part)
+    except ValueError:
+        raise DeviceError(f"bad time: {text!r} (use seconds like 12.5 or m:ss.mmm)") from None
+    if secs < 0:
+        raise DeviceError(f"bad time: {text!r} (negative)")
+    return secs
+
+
+def bars_secs(bpm: float, bars: float, beats: int = 4) -> float:
+    """Length of `bars` bars of `beats` beats at `bpm`."""
+    if bpm <= 0 or bars <= 0 or beats <= 0:
+        raise DeviceError("bpm, bars and beats must be positive")
+    return bars * beats * 60.0 / bpm
+
+
+def trim_pcm(pcm: bytes, start: float = 0.0, end: float = None) -> bytes:
+    """Cut PCM to [start, end) seconds, rounded to the nearest sample (end=None: to the end)."""
+    total = len(pcm) // SAMPLE_WIDTH
+    a = round(start * SAMPLE_RATE)
+    b = total if end is None else round(end * SAMPLE_RATE)
+    if a >= total:
+        raise DeviceError(f"start {fmt_secs(start)} is past the end of the audio ({fmt_secs(total / SAMPLE_RATE)})")
+    if b > total:
+        raise DeviceError(f"end {fmt_secs(end)} is past the end of the audio ({fmt_secs(total / SAMPLE_RATE)})")
+    if b <= a:
+        raise DeviceError("end must be after start")
+    return pcm[a * SAMPLE_WIDTH:b * SAMPLE_WIDTH]
+
+
 def build_record(length: int, blocks) -> bytes:
     """Index record as written by the official tool (0x407c1e..0x407cf8)."""
     rec = bytearray(b"\xff" * RECORD_SIZE)
@@ -843,11 +877,37 @@ def cmd_about(lp, args):
     ])
 
 
+def cut_for_upload(pcm: bytes, args) -> bytes:
+    """Apply upload's --start/--end/--length/--bpm/--bars to the audio."""
+    if args.bars is not None and args.bpm is None:
+        raise DeviceError("--bars needs --bpm")
+    if sum(x is not None for x in (args.end, args.length, args.bpm)) > 1:
+        raise DeviceError("use only one of --end, --length, --bpm/--bars")
+    start = parse_time(args.start) if args.start else 0.0
+    end = None
+    if args.end:
+        end = parse_time(args.end)
+    elif args.length:
+        end = start + parse_time(args.length)
+    elif args.bpm is not None:
+        end = start + bars_secs(args.bpm, args.bars or 1, args.beats)
+    if start == 0 and end is None:
+        return pcm
+    out = trim_pcm(pcm, start, end)
+    n = len(out) // SAMPLE_WIDTH
+    pad = -n % (TAIL_UNIT // SAMPLE_WIDTH)
+    print(f"cut {fmt_secs(start)} -> {fmt_secs(start + n / SAMPLE_RATE)}: "
+          f"{n} samples = {n / SAMPLE_RATE:.3f} s"
+          + (f" (+{pad} samples = {pad / SAMPLE_RATE * 1000:.2f} ms silence: the pedal stores "
+             f"lengths in {TAIL_UNIT // SAMPLE_WIDTH}-sample steps)" if pad else ""), file=sys.stderr)
+    return out
+
+
 def cmd_upload(lp, args):
     model = int.from_bytes(lp.read(AREA_MCU, 0x2180, 16)[4:8], "little")
     if model != 0x2715 and not args.force:
         raise DeviceError(f"model id 0x{model:04x} is not a NANO LOOPER (0x2715); refusing to write (--force)")
-    pcm = load_audio(args.file)
+    pcm = cut_for_upload(load_audio(args.file), args)
     print(f"uploading {args.file} ({fmt_secs(len(pcm) / SAMPLE_WIDTH / SAMPLE_RATE)}); "
           "it becomes the loop the pedal plays", file=sys.stderr)
     blocks = upload_loop(lp, pcm)
@@ -1015,8 +1075,21 @@ already empty are used (check with 'space'); every block is verified with the
 pedal's checksum. The previous loop is NOT deleted: it stays in 'list' and can
 come back with 'select'. Takes ~1 s per second of audio.
 
+cut: --start/--end keep only part of the file, cut to the exact sample, so a
+loop can be timed precisely. Times are seconds (12.5) or m:ss.mmm (1:02.345).
+Instead of --end give --length, or --bpm with --bars for a whole number of
+bars (4 beats per bar, change with --beats):
+  ap09 upload song.wav --start 1:02.345 --end 1:10.345
+  ap09 upload song.wav --start 3.21 --bpm 120 --bars 4      # 8.000 s
+
 After the upload unplug and replug the pedal.""")
     p.add_argument("file", help="audio file to upload")
+    p.add_argument("--start", metavar="T", help="cut: start at time T (default: 0)")
+    p.add_argument("--end", metavar="T", help="cut: stop at time T (default: end of file)")
+    p.add_argument("--length", metavar="T", help="cut: keep T from --start")
+    p.add_argument("--bpm", type=float, help="cut: keep --bars bars at this tempo from --start")
+    p.add_argument("--bars", type=float, help="number of bars for --bpm (default: 1)")
+    p.add_argument("--beats", type=int, default=4, help="beats per bar for --bpm (default: 4)")
     p.add_argument("--force", action="store_true", help="write even if the model id is not NANO LOOPER (0x2715)")
     p.set_defaults(func=cmd_upload)
 

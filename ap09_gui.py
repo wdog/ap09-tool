@@ -103,6 +103,7 @@ class Waveform(Gtk.DrawingArea):
         self.peaks = None
         self.position = None  # 0..1 playhead
         self.placeholder = ""
+        self.selection = None  # (a, b) 0..1 kept part, the rest is dimmed
         self.set_content_height(height)
         self.set_hexpand(True)
         self.set_draw_func(self._draw)
@@ -114,6 +115,11 @@ class Waveform(Gtk.DrawingArea):
 
     def set_position(self, pos):
         self.position = pos
+        self.queue_draw()
+
+    def set_selection(self, a, b):
+        """Highlight [a, b] (0..1) and dim the rest; None clears it."""
+        self.selection = None if a is None else (a, b)
         self.queue_draw()
 
     def _draw(self, area, cr, w, h):
@@ -137,12 +143,22 @@ class Waveform(Gtk.DrawingArea):
         n = len(self.peaks)
         bar = w / n
         played = int(self.position * n) if self.position is not None else -1
+        sel = self.selection
         for i, p in enumerate(self.peaks):
             a = 1.0 if (played < 0 or i <= played) else 0.35
+            if sel and not sel[0] <= (i + 0.5) / n <= sel[1]:
+                a = 0.18
             cr.set_source_rgba(accent.red, accent.green, accent.blue, a)
             y = max(1.0, p * (mid - 2))
             cr.rectangle(i * bar, mid - y, max(1.0, bar - 0.6), 2 * y)
-        cr.fill()
+            cr.fill()
+        if sel:
+            cr.set_source_rgba(accent.red, accent.green, accent.blue, 1.0)
+            cr.set_line_width(2)
+            for f in sel:
+                cr.move_to(f * w, 0)
+                cr.line_to(f * w, h)
+            cr.stroke()
         if self.position is not None:
             x = self.position * w
             cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.9)
@@ -895,8 +911,9 @@ class LooperWindow(Adw.ApplicationWindow):
 
     def _confirm_upload(self, path, pcm):
         self._end_progress()
-        secs = len(pcm) / ap09.SAMPLE_WIDTH / ap09.SAMPLE_RATE
-        blocks = -(-len(pcm) // (ap09.PAGE_AUDIO * ap09.PAGES_PER_BLOCK))
+        rate, width = ap09.SAMPLE_RATE, ap09.SAMPLE_WIDTH
+        total = len(pcm) // width / rate
+        per_block = ap09.PAGE_AUDIO * ap09.PAGES_PER_BLOCK
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_top=6)
         frame = Gtk.Box(margin_top=12, margin_bottom=12, margin_start=14, margin_end=14)
         wave = Waveform(height=72)
@@ -907,13 +924,129 @@ class LooperWindow(Adw.ApplicationWindow):
         card.add_css_class("card")
         card.append(frame)
         body.append(card)
-        space = ""
-        if self.space:
-            free = self.space[0]
-            space = f"\nFree memory: {free} blocks" + ("  ⚠ not enough!" if free < blocks else "")
+
+        def spin(value, upper, digits=3, step=0.001, page=0.1):
+            adj = Gtk.Adjustment(value=value, lower=0, upper=upper, step_increment=step, page_increment=page)
+            return Gtk.SpinButton(adjustment=adj, digits=digits, numeric=True, hexpand=True)
+
+        start_s = spin(0, total)
+        end_s = spin(total, total)
+        bpm_s = spin(0, 400, digits=2, step=0.01, page=1)
+        bars_s = spin(4, 256, digits=0, step=1, page=4)
+        bars_s.get_adjustment().set_lower(1)
+        grid = Gtk.Grid(column_spacing=10, row_spacing=6)
+        for col, (text, w) in enumerate((("Start (s)", start_s), ("End (s)", end_s))):
+            grid.attach(Gtk.Label(label=text, xalign=0), col * 2, 0, 1, 1)
+            grid.attach(w, col * 2 + 1, 0, 1, 1)
+        for col, (text, w) in enumerate((("BPM", bpm_s), ("Bars", bars_s))):
+            grid.attach(Gtk.Label(label=text, xalign=0), col * 2, 1, 1, 1)
+            grid.attach(w, col * 2 + 1, 1, 1, 1)
+        body.append(grid)
+        hint = Gtk.Label(label="Click the waveform to move the nearest edge. "
+                               "With a BPM the end follows start + bars (4/4).",
+                         wrap=True, xalign=0)
+        hint.add_css_class("dim-label")
+        hint.add_css_class("caption")
+        body.append(hint)
+        info = Gtk.Label(xalign=0, wrap=True)
+        preview_btn = Gtk.Button(icon_name="media-playback-start-symbolic", tooltip_text="Preview the cut, looped",
+                                 valign=Gtk.Align.CENTER)
+        preview_btn.add_css_class("circular")
+        row = Gtk.Box(spacing=12)
+        row.append(preview_btn)
+        row.append(info)
+        body.append(row)
+
+        cut = {"a": 0, "b": len(pcm) // width}   # kept samples [a, b)
+        busy = [False]
+
+        def update(*_):
+            if busy[0]:
+                return
+            busy[0] = True
+            bpm = bpm_s.get_value()
+            end_s.set_sensitive(bpm <= 0)
+            if bpm > 0:
+                end_s.set_value(min(total, start_s.get_value() + ap09.bars_secs(bpm, bars_s.get_value())))
+            a = round(start_s.get_value() * rate)
+            b = round(end_s.get_value() * rate)
+            cut["a"], cut["b"] = a, b
+            busy[0] = False
+            if (a, b) == (0, len(pcm) // width):
+                wave.set_selection(None, None)
+            else:
+                wave.set_selection(a / rate / total, b / rate / total)
+            stop_preview()
+            n = b - a
+            if n <= 0:
+                info.set_label("⚠ end must be after start")
+                dlg_ok(False)
+                return
+            blocks = -(-n * width // per_block)
+            text = f"Loop: {n / rate:.3f} s · {n} samples · {blocks} memory blocks"
+            pad = -n % (ap09.TAIL_UNIT // width)
+            if pad:
+                text += f"\nThe pedal adds {pad / rate * 1000:.2f} ms of silence at the end"
+            if bpm > 0 and end_s.get_value() < start_s.get_value() + ap09.bars_secs(bpm, bars_s.get_value()) - 1e-6:
+                text += "\n⚠ the file ends before the last bar"
+            if self.space:
+                free = self.space[0]
+                text += f"\nFree memory: {free} blocks" + ("  ⚠ not enough!" if free < blocks else "")
+            info.set_label(text)
+            dlg_ok(True)
+
+        def on_click(g, n_press, x, y):
+            t = min(max(x / max(1, wave.get_width()), 0), 1) * total
+            if bpm_s.get_value() > 0 or abs(t - start_s.get_value()) <= abs(t - end_s.get_value()):
+                start_s.set_value(t)
+            else:
+                end_s.set_value(t)
+
+        click = Gtk.GestureClick()
+        click.connect("pressed", on_click)
+        wave.add_controller(click)
+
+        preview_path = os.path.join(CACHE_DIR, "cut-preview.wav")
+        reps = 4
+
+        def preview_pos(pos):
+            if pos is None:
+                wave.set_position(None)
+                return
+            f = (pos * reps) % 1
+            wave.set_position((cut["a"] + f * (cut["b"] - cut["a"])) / rate / total)
+
+        def preview_state(playing):
+            preview_btn.set_icon_name("media-playback-stop-symbolic" if playing else "media-playback-start-symbolic")
+
+        if not hasattr(self, "_preview"):
+            self._preview = Player(lambda *_: None, lambda *_: None)
+        preview = self._preview
+        preview.on_position, preview.on_state = preview_pos, preview_state
+
+        def stop_preview():
+            if preview.playing:
+                preview.stop()
+
+        def toggle_preview(_):
+            if preview.playing:
+                preview.stop()
+                return
+            if cut["b"] <= cut["a"]:
+                return
+            if self.player.playing:
+                self.player.pause()
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            ap09.write_wav(preview_path, pcm[cut["a"] * width:cut["b"] * width] * reps)
+            preview.play(preview_path)
+
+        preview_btn.connect("clicked", toggle_preview)
+        for w in (start_s, end_s, bpm_s, bars_s):
+            w.connect("value-changed", update)
+
         dlg = Alert(
             heading="Put this on the pedal?",
-            body=f"{os.path.basename(path)}\n{fmt_secs(secs)} · {blocks} memory blocks{space}\n\n"
+            body=f"{os.path.basename(path)} ({fmt_secs(total)})\n\n"
                  "It replaces the loop the pedal plays. The current loop stays in memory "
                  "and can be put back later.")
         dlg.set_extra_child(body)
@@ -922,12 +1055,20 @@ class LooperWindow(Adw.ApplicationWindow):
         dlg.set_response_appearance("upload", Adw.ResponseAppearance.SUGGESTED)
         dlg.set_default_response("upload")
 
+        def dlg_ok(ok):
+            btn = getattr(dlg, "_default_btn", None)
+            if btn:
+                btn.set_sensitive(ok)
+
         def resp(d, r):
-            if r == "upload":
-                self.do_upload(path, pcm)
+            stop_preview()
+            if r == "upload" and cut["b"] > cut["a"]:
+                self.do_upload(path, pcm[cut["a"] * width:cut["b"] * width])
 
         dlg.connect("response", resp)
         dlg.present(self)
+        dlg.dialog.connect("closed", lambda *_: stop_preview())
+        update()
 
     def do_upload(self, path, pcm):
         def job(lp, progress):
