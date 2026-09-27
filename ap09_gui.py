@@ -21,7 +21,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Gst", "1.0")
-from gi.repository import Adw, Gdk, Gio, GLib, Gst, Gtk, Pango  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gst, Gtk, Pango  # noqa: E402
 
 import numpy as np  # noqa: E402
 import usb.core  # noqa: E402
@@ -36,9 +36,8 @@ CACHE_DIR = ap09.cache_dir()
 AUDIO_FILTER_MIME = ["audio/*"]
 
 CSS = b"""
-.hero { padding: 18px; }
-.hero-title { font-size: 1.6em; font-weight: 800; }
-.big-time { font-size: 2.4em; font-weight: 800; font-feature-settings: "tnum"; }
+.hero { padding: 12px 16px; }
+.big-time { font-size: 2em; font-weight: 800; font-feature-settings: "tnum"; }
 .state-playing { color: @success_color; }
 .state-saved { color: @accent_color; }
 .state-damaged { color: @warning_color; }
@@ -50,12 +49,14 @@ CSS = b"""
 .badge-damaged { background: alpha(@warning_color, 0.2); color: @warning_color; }
 .badge-memory { background: alpha(@accent_color, 0.18); color: @accent_color; }
 .badge-deleted { background: alpha(@window_fg_color, 0.1); color: alpha(@window_fg_color, 0.6); }
-.dropzone { border: 2px dashed alpha(@accent_color, 0.6); border-radius: 18px; padding: 22px; }
+.dropzone { border: 2px dashed alpha(@accent_color, 0.6); border-radius: 12px; padding: 10px; }
 .dropzone.hover { background: alpha(@accent_color, 0.12); border-style: solid; }
 .player { padding: 6px 12px; }
-.progress-card { padding: 14px 18px; margin: 10px 12px 0 12px; }
+.side-heading { margin-top: 6px; }
+.device-key { min-width: 48px; }
+.progress-card { padding: 10px 14px; margin: 8px 12px 0 12px; }
 .progress-card progressbar trough, .progress-card progressbar progress { min-height: 12px; border-radius: 6px; }
-.progress-pct { font-size: 2em; font-weight: 800; font-feature-settings: "tnum"; }
+.progress-pct { font-size: 1.6em; font-weight: 800; font-feature-settings: "tnum"; }
 """
 
 
@@ -372,7 +373,8 @@ class Player:
 class LooperWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="AP-09 Looper")
-        self.set_default_size(760, 820)
+        self.set_default_size(940, 600)
+        self.set_size_request(360, 420)
         self.worker = Worker()
         self.records = []
         self.connected = None
@@ -382,19 +384,13 @@ class LooperWindow(Adw.ApplicationWindow):
         self.play_buttons = {}   # loop key -> list of buttons
         self.player = Player(self._on_play_position, self._on_play_state)
 
-        # header
-        self.title = Adw.WindowTitle(title="AP-09 Looper", subtitle="looking for the pedal…")
+        # content header: device status, refresh, sidebar toggle when collapsed
+        self.title = Adw.WindowTitle(title="Loops", subtitle="looking for the pedal…")
         header = Adw.HeaderBar(title_widget=self.title)
-        self.upload_btn = Gtk.Button(label="Upload", icon_name="document-send-symbolic",
-                                     tooltip_text="Put an audio file on the pedal")
-        self.upload_btn.set_child(self._label_icon("document-send-symbolic", "Upload"))
-        self.upload_btn.add_css_class("suggested-action")
-        self.upload_btn.connect("clicked", lambda *_: self.choose_upload())
-        header.pack_start(self.upload_btn)
         self.refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Refresh (F5)")
         self.refresh_btn.connect("clicked", lambda *_: self.refresh())
-        header.pack_end(self._build_menu())
         header.pack_end(self.refresh_btn)
+        self._register_actions()
 
         # progress card under the header
         self.progress_rev = Gtk.Revealer(child=self._build_progress_card(),
@@ -410,11 +406,28 @@ class LooperWindow(Adw.ApplicationWindow):
         self.player_bar = self._build_player_bar()
 
         self.toasts = Adw.ToastOverlay(child=self.stack)
-        view = Adw.ToolbarView(content=self.toasts)
-        view.add_top_bar(header)
-        view.add_top_bar(self.progress_rev)
-        view.add_bottom_bar(self.player_bar)
-        self.set_content(view)
+        content = Adw.ToolbarView(content=self.toasts)
+        content.add_top_bar(header)
+        content.add_top_bar(self.progress_rev)
+        content.add_bottom_bar(self.player_bar)
+
+        # sidebar: upload, memory, actions, device details
+        side_header = Adw.HeaderBar(title_widget=Gtk.Label(label="AP-09 Looper", css_classes=["heading"]))
+        sidebar = Adw.ToolbarView(content=self._build_sidebar())
+        sidebar.add_top_bar(side_header)
+
+        self.split = Adw.OverlaySplitView(sidebar=sidebar, content=content,
+                                          min_sidebar_width=230, max_sidebar_width=270)
+        toggle = Gtk.ToggleButton(icon_name="sidebar-show-symbolic", tooltip_text="Show sidebar (F9)")
+        self.split.bind_property("show-sidebar", toggle, "active",
+                                 GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE)
+        self.split.bind_property("collapsed", toggle, "visible", GObject.BindingFlags.SYNC_CREATE)
+        header.pack_start(toggle)
+        self.set_content(self.split)
+
+        bp = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 700sp"))
+        bp.add_setter(self.split, "collapsed", True)
+        self.add_breakpoint(bp)
 
         # drag & drop anywhere in the window
         drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
@@ -441,20 +454,96 @@ class LooperWindow(Adw.ApplicationWindow):
         box.append(Gtk.Label(label=text))
         return box
 
-    def _build_menu(self):
-        menu = Gio.Menu()
-        menu.append("Scan free space", "win.space")
-        menu.append("Clear the pedal", "win.clear")
-        menu.append("Download all loops…", "win.download-all")
-        menu.append("Open cache folder", "win.cache")
-        menu.append("About", "win.about")
-        for name, cb in (("space", self.scan_space), ("clear", self.confirm_clear),
+    def _register_actions(self):
+        for name, cb in (("upload", self.choose_upload), ("space", self.scan_space), ("clear", self.confirm_clear),
                          ("download-all", self.download_all), ("about", self.show_about),
                          ("cache", lambda: Gio.AppInfo.launch_default_for_uri(Gst.filename_to_uri(CACHE_DIR), None))):
             act = Gio.SimpleAction.new(name, None)
             act.connect("activate", lambda _a, _p, f=cb: f())
             self.add_action(act)
-        return Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu, tooltip_text="Menu")
+
+    def _side_action(self, name):
+        if self.split.get_collapsed():
+            self.split.set_show_sidebar(False)  # overlay sidebar: get out of the way
+        self.activate_action(f"win.{name}")
+
+    @staticmethod
+    def _side_heading(text):
+        lbl = Gtk.Label(label=text, xalign=0)
+        lbl.add_css_class("caption-heading")
+        lbl.add_css_class("dim-label")
+        lbl.add_css_class("side-heading")
+        return lbl
+
+    def _build_sidebar(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                      margin_top=4, margin_bottom=12, margin_start=12, margin_end=12)
+
+        # upload button doubling as drop zone (drop works anywhere in the window)
+        dz = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        dz.append(Gtk.Image(icon_name="document-send-symbolic", pixel_size=24))
+        dz_title = Gtk.Label(label="Upload")
+        dz_title.add_css_class("heading")
+        dz_sub = Gtk.Label(label="click or drop an audio file", wrap=True, justify=Gtk.Justification.CENTER)
+        dz_sub.add_css_class("dim-label")
+        dz_sub.add_css_class("caption")
+        dz.append(dz_title)
+        dz.append(dz_sub)
+        self.upload_btn = Gtk.Button(child=dz, tooltip_text="Put an audio file on the pedal (Ctrl+O)\n"
+                                     "wav · mp3 · flac · ogg … converted to mono 24-bit 46875 Hz")
+        self.upload_btn.add_css_class("flat")
+        self.upload_btn.add_css_class("dropzone")
+        self.upload_btn.connect("clicked", lambda *_: self._side_action("upload"))
+        self.upload_btn.set_sensitive(False)
+        self.dropzone = self.upload_btn
+        box.append(self.upload_btn)
+
+        # memory
+        box.append(self._side_heading("MEMORY"))
+        mem = Gtk.Box(spacing=8)
+        self.space_label = Gtk.Label(label="free space not scanned", xalign=0, wrap=True, hexpand=True)
+        self.space_label.add_css_class("caption")
+        scan = Gtk.Button(label="Scan", valign=Gtk.Align.CENTER, tooltip_text="Full scan, about 4 minutes")
+        scan.add_css_class("flat")
+        scan.connect("clicked", lambda *_: self.scan_space())
+        mem.append(self.space_label)
+        mem.append(scan)
+        box.append(mem)
+        self.space_level = Gtk.LevelBar(min_value=0, max_value=1, visible=False)
+        box.append(self.space_level)
+
+        # actions
+        box.append(self._side_heading("ACTIONS"))
+        actions = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        actions.add_css_class("navigation-sidebar")
+        for icon, text, name in (("folder-download-symbolic", "Download all loops…", "download-all"),
+                                 ("edit-clear-all-symbolic", "Clear the pedal", "clear"),
+                                 ("folder-symbolic", "Open cache folder", "cache"),
+                                 ("help-about-symbolic", "About", "about")):
+            row = Gtk.ListBoxRow(child=self._label_icon(icon, text))
+            row.action = name
+            actions.append(row)
+        actions.connect("row-activated", lambda _l, row: self._side_action(row.action))
+        box.append(actions)
+
+        # device details
+        box.append(self._side_heading("DEVICE"))
+        grid = Gtk.Grid(column_spacing=8, row_spacing=2)
+        self.device_rows = {}
+        for i, key in enumerate(("model", "usb", "format", "info", "index")):
+            k = Gtk.Label(label=key, xalign=0, yalign=0)
+            k.add_css_class("caption")
+            k.add_css_class("dim-label")
+            k.add_css_class("device-key")
+            v = Gtk.Label(label="–", xalign=0, wrap=True, selectable=True, hexpand=True,
+                          wrap_mode=Pango.WrapMode.WORD_CHAR)
+            v.add_css_class("caption")
+            grid.attach(k, 0, i, 1, 1)
+            grid.attach(v, 1, i, 1, 1)
+            self.device_rows[key] = v
+        box.append(grid)
+
+        return Gtk.ScrolledWindow(child=box, vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
 
     def _build_progress_card(self):
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -498,81 +587,38 @@ class LooperWindow(Adw.ApplicationWindow):
         return page
 
     def _build_main(self):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
-                      margin_top=18, margin_bottom=24, margin_start=12, margin_end=12)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                      margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
 
-        # hero card: what the pedal plays
-        hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        # hero card: what the pedal plays, all on one row
+        hero = Gtk.Box(spacing=14)
         hero.add_css_class("card")
         hero.add_css_class("hero")
-        top = Gtk.Box(spacing=12)
-        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+        self.hero_left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0, valign=Gtk.Align.CENTER)
         cap = Gtk.Label(label="ON THE PEDAL", xalign=0)
         cap.add_css_class("caption-heading")
         cap.add_css_class("dim-label")
         self.hero_time = Gtk.Label(xalign=0)
         self.hero_time.add_css_class("big-time")
-        self.hero_sub = Gtk.Label(xalign=0)
+        self.hero_sub = Gtk.Label(xalign=0, wrap=True)
         self.hero_sub.add_css_class("dim-label")
-        left.append(cap)
-        left.append(self.hero_time)
-        left.append(self.hero_sub)
-        top.append(left)
-        self.hero_buttons = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
-        top.append(self.hero_buttons)
-        hero.append(top)
-        self.hero_wave = Waveform(height=110)
+        self.hero_sub.add_css_class("caption")
+        self.hero_left.append(cap)
+        self.hero_left.append(self.hero_time)
+        self.hero_left.append(self.hero_sub)
+        hero.append(self.hero_left)
+        self.hero_wave = Waveform(height=64)
+        self.hero_wave.set_valign(Gtk.Align.CENTER)
         click = Gtk.GestureClick()
         click.connect("pressed", self._on_hero_wave_click)
         self.hero_wave.add_controller(click)
         hero.append(self.hero_wave)
+        self.hero_buttons = Gtk.Box(spacing=4, valign=Gtk.Align.CENTER)
+        hero.append(self.hero_buttons)
         box.append(hero)
 
-        # drop zone
-        self.dropzone = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        self.dropzone.add_css_class("dropzone")
-        dz_icon = Gtk.Image(icon_name="folder-music-symbolic", pixel_size=36)
-        dz_icon.add_css_class("dim-label")
-        dz_title = Gtk.Label(label="Drop an audio file here to put it on the pedal")
-        dz_title.add_css_class("heading")
-        dz_sub = Gtk.Label(label="wav · mp3 · flac · ogg … converted to mono 24-bit 46875 Hz")
-        dz_sub.add_css_class("dim-label")
-        dz_sub.add_css_class("caption")
-        for w in (dz_icon, dz_title, dz_sub):
-            self.dropzone.append(w)
-        dz_click = Gtk.GestureClick()
-        dz_click.connect("released", lambda *_: self.choose_upload())
-        self.dropzone.add_controller(dz_click)
-        self.dropzone.set_cursor(Gdk.Cursor.new_from_name("pointer"))
-        box.append(self.dropzone)
-
-        # memory
-        mem = Adw.PreferencesGroup(title="Memory")
-        self.space_row = Adw.ActionRow(title="Free space", subtitle="not scanned yet")
-        self.space_row.add_prefix(Gtk.Image(icon_name="drive-harddisk-symbolic"))
-        self.space_level = Gtk.LevelBar(min_value=0, max_value=1, valign=Gtk.Align.CENTER, width_request=120)
-        self.space_level.set_visible(False)
-        self.space_row.add_suffix(self.space_level)
-        scan = Gtk.Button(label="Scan", valign=Gtk.Align.CENTER, tooltip_text="Full scan, about 4 minutes")
-        scan.connect("clicked", lambda *_: self.scan_space())
-        self.space_row.add_suffix(scan)
-        mem.add(self.space_row)
-        self.device_row = Adw.ExpanderRow(title="Device", subtitle="–")
-        self.device_row.add_prefix(Gtk.Image(icon_name="audio-card-symbolic"))
-        self.device_rows = {}
-        for key in ("model", "usb", "format", "info", "index"):
-            row = Adw.ActionRow(title=key, subtitle="–", subtitle_selectable=True)
-            row.add_css_class("property")
-            self.device_row.add_row(row)
-            self.device_rows[key] = row
-        mem.add(self.device_row)
-        box.append(mem)
-
         # history
-        self.history = Adw.PreferencesGroup(
-            title="Loops",
-            description="▶ playing · ● in memory · ⚠ damaged · ✖ deleted. "
-                        "Numbers are the same as in the CLI (ap09 list).")
+        self.history = Adw.PreferencesGroup(title="Loops")
         self.show_deleted = Gtk.Switch(valign=Gtk.Align.CENTER, tooltip_text="Show deleted loops (list --all)")
         self.show_deleted.connect("notify::active", lambda *_: self._fill_history())
         sd = Gtk.Box(spacing=6)
@@ -584,10 +630,15 @@ class LooperWindow(Adw.ApplicationWindow):
         self.history_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.history_list.add_css_class("boxed-list")
         self.history.add(self.history_list)
+        legend = Gtk.Label(label="● in memory · ⚠ damaged · ✖ deleted · numbers match ap09 list",
+                           xalign=0, wrap=True, margin_top=8)
+        legend.add_css_class("caption")
+        legend.add_css_class("dim-label")
+        self.history.add(legend)
         box.append(self.history)
 
-        clamp = Adw.Clamp(maximum_size=760, child=box)
-        return Gtk.ScrolledWindow(child=clamp, vexpand=True)
+        clamp = Adw.Clamp(maximum_size=960, tightening_threshold=700, child=box)
+        return Gtk.ScrolledWindow(child=clamp, vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
 
     def _build_player_bar(self):
         bar = Gtk.Box(spacing=10)
@@ -651,14 +702,13 @@ class LooperWindow(Adw.ApplicationWindow):
         self.stack.set_visible_child_name("main")
         name = d["model_name"] if d["model"] == 0x2715 else f"unknown model 0x{d['model']:04x}"
         self.title.set_subtitle(name)
-        self.device_row.set_subtitle(f"{name} · USB {d['usb']} · bus {d['bus']} addr {d['address']}")
         cur = next((r for r in recs if r["current"]), None)
         values = {"model": f"0x{d['model']:04x} {d['model_name']}",
                   "usb": f"{d['usb']} · bus {d['bus']} addr {d['address']}",
                   "format": d["format"], "info": d["info"],
                   "index": f"record @ +{cur['offset']:#x}" if cur else "no loop"}
         for k, v in values.items():
-            self.device_rows[k].set_subtitle(v)
+            self.device_rows[k].set_label(v)
         self.waveforms.clear()
         self.play_buttons.clear()
         self._fill_hero()
@@ -685,12 +735,15 @@ class LooperWindow(Adw.ApplicationWindow):
             self.hero_sub.set_label("Record one on the pedal, upload a file, or restore one below")
             self.hero_wave.set_peaks(None, "")
             self.hero_wave.set_visible(False)
+            self.hero_left.set_hexpand(True)
             return
         self.hero_wave.set_visible(True)
+        self.hero_left.set_hexpand(False)
         self.hero_time.remove_css_class("state-empty")
         self.hero_time.add_css_class("state-playing")
         self.hero_time.set_label(fmt_secs(loop_secs(cur)))
-        self.hero_sub.set_label(f"▶ playing #{cur['num']} · {len(cur['blocks'])} blocks · {cur['length']:,} bytes")
+        self.hero_sub.set_label(f"#{cur['num']} · {len(cur['blocks'])} blocks")
+        self.hero_sub.set_tooltip_text(f"{cur['length']:,} bytes")
         self._register_wave(cur, self.hero_wave)
         play = self._play_button(cur)
         play.add_css_class("suggested-action")
@@ -704,22 +757,23 @@ class LooperWindow(Adw.ApplicationWindow):
         loops = getattr(self, "all_loops", self.records)
         shown = [r for r in loops if not r["current"] and (self.show_deleted.get_active() or not r["deleted"])]
         self.history.set_visible(bool([r for r in loops if not r["current"]]))
+        badges = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)  # align the #n titles
         for r in reversed(shown):  # newest first
             kind, label = self._state(r)
             row = Adw.ActionRow(title=f"#{r['num']}", subtitle=f"{fmt_secs(loop_secs(r))} · {len(r['blocks'])} blocks")
-            row.add_prefix(badge(label, kind))
-            wave = Waveform(height=34)
-            wave.set_size_request(150, -1)
+            b = badge(label, kind)
+            badges.add_widget(b)
+            row.add_prefix(b)
+            wave = Waveform(height=28)
+            wave.set_size_request(120, -1)
             wave.set_hexpand(False)
             self._register_wave(r, wave)
             row.add_suffix(wave)
             row.add_suffix(self._play_button(r))
             row.add_suffix(icon_button("document-save-symbolic", "Save as WAV…", self.download, r))
-            restore = Gtk.Button(label="Put on pedal", valign=Gtk.Align.CENTER,
-                                 tooltip_text=f"Make #{r['num']} the loop the pedal plays (select {r['num']})")
-            restore.add_css_class("pill")
-            restore.connect("clicked", lambda *_, r=r: self.confirm_select(r["num"], r))
-            row.add_suffix(restore)
+            row.add_suffix(icon_button("edit-undo-symbolic",
+                                       f"Put on pedal: make #{r['num']} the loop the pedal plays (select {r['num']})",
+                                       self.confirm_select, r["num"], r))
             if not r["deleted"]:
                 row.add_suffix(icon_button("user-trash-symbolic", f"Delete #{r['num']} (delete {r['num']})",
                                            self.confirm_delete, r["num"], r))
@@ -1151,8 +1205,8 @@ class LooperWindow(Adw.ApplicationWindow):
             self.space = result
             free, slots = result
             secs = free * ap09.PER_BLOCK_S
-            self.space_row.set_subtitle(f"{free} empty blocks · about {fmt_secs(secs)} of audio · "
-                                        f"{slots} index slots left")
+            self.space_label.set_label(f"{free} empty blocks · ~{fmt_secs(secs)} of audio · "
+                                       f"{slots} index slots left")
             self.space_level.set_visible(True)
             self.space_level.set_value(min(1.0, free / ap09.MAX_BLOCKS))
 
@@ -1282,6 +1336,9 @@ class LooperWindow(Adw.ApplicationWindow):
         dlg.present(self)
 
     def _on_key(self, ctrl, keyval, keycode, state):
+        if keyval == Gdk.KEY_F9:
+            self.split.set_show_sidebar(not self.split.get_show_sidebar())
+            return True
         if keyval == Gdk.KEY_F5:
             self.refresh()
             return True
