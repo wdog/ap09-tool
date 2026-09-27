@@ -4,3 +4,7 @@ __pycache__/
 *.syx
 re/
 docs/PUBLISHING.md
+build/
+dist/
+*.egg-info/
+.ruff_cache/
