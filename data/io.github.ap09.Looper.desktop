@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=AP-09 Looper
+GenericName=Looper pedal manager
+Comment=Download, play and upload loops on the Ammoon AP-09 nano looper
+Exec=ap09-gui
+Icon=io.github.ap09.Looper
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=looper;pedal;ammoon;rowin;guitar;
+StartupNotify=true

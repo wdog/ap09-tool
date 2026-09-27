@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ap09-tool"
+dynamic = ["version"]
+description = "Download, upload, play and restore loops on the Ammoon AP-09 nano looper (Rowin, USB 0416:5555) from Linux"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "wdog", email = "wdog666@gmail.com" }]
+requires-python = ">=3.11"
+dependencies = ["pyusb>=1.0"]
+keywords = ["looper", "ammoon", "ap-09", "rowin", "usb", "midi", "sysex", "reverse-engineering"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: X11 Applications :: GTK",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+
+[project.optional-dependencies]
+# the GUI also needs PyGObject + GTK 4 + libadwaita + GStreamer, best taken from the distro (see README)
+gui = ["numpy"]
+
+[project.scripts]
+ap09 = "ap09:main"
+
+[project.gui-scripts]
+ap09-gui = "ap09_gui:main"
+
+[project.urls]
+Homepage = "https://github.com/wdog/ap09-tool"
+Issues = "https://github.com/wdog/ap09-tool/issues"
+"Original request" = "https://github.com/reinerh/loopertrx/issues/1"
+
+[tool.setuptools]
+py-modules = ["ap09", "ap09_gui"]
+
+[tool.setuptools.dynamic]
+version = { attr = "ap09.__version__" }

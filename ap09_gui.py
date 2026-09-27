@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ap09-gui: GTK4 / libadwaita front end for ap09.py (Ammoon AP-09 nano looper).
+ap09-gui: GTK4 / libadwaita front end for ap09 (Ammoon AP-09 nano looper).
 
 All pedal I/O runs on one background worker thread (the pedal only handles one
 client at a time); the UI is updated through GLib.idle_add.
@@ -30,6 +30,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ap09  # noqa: E402
 
 APP_ID = "io.github.ap09.Looper"
+# icon: installed into the hicolor theme by install.sh, or found next to this file in a source checkout
+ICON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "icons")
 CACHE_DIR = ap09.cache_dir()
 AUDIO_FILTER_MIME = ["audio/*"]
 
@@ -570,7 +572,7 @@ class LooperWindow(Adw.ApplicationWindow):
         self.history = Adw.PreferencesGroup(
             title="Loops",
             description="▶ playing · ● in memory · ⚠ damaged · ✖ deleted. "
-                        "Numbers are the same as in the CLI (ap09.py list).")
+                        "Numbers are the same as in the CLI (ap09 list).")
         self.show_deleted = Gtk.Switch(valign=Gtk.Align.CENTER, tooltip_text="Show deleted loops (list --all)")
         self.show_deleted.connect("notify::active", lambda *_: self._fill_history())
         sd = Gtk.Box(spacing=6)
@@ -1227,7 +1229,7 @@ class LooperWindow(Adw.ApplicationWindow):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
                       margin_top=24, margin_bottom=32, margin_start=32, margin_end=32)
         head = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        head.append(Gtk.Image(icon_name="audio-x-generic", pixel_size=96))
+        head.append(Gtk.Image(icon_name=app_icon(), pixel_size=96))
         head.append(label("AP-09 Looper", "title-1"))
         head.append(label(f"version {ap09.__version__}", "dim-label"))
         box.append(head)
@@ -1254,7 +1256,7 @@ class LooperWindow(Adw.ApplicationWindow):
         for title, sub in (
             ("Replug after changes", "after upload, put back, delete or clear, unplug and replug the pedal"),
             ("Audio is never wiped", "the pedal ignores erase over USB: deleted loops only disappear from the list"),
-            ("One program at a time", "don't use the CLI (ap09.py) while this app is working on the pedal"),
+            ("One program at a time", "don't use the CLI (ap09) while this app is working on the pedal"),
         ):
             good.add(Adw.ActionRow(title=title, subtitle=sub))
         box.append(good)
@@ -1292,6 +1294,11 @@ class LooperWindow(Adw.ApplicationWindow):
         return False
 
 
+def app_icon():
+    theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+    return APP_ID if theme.has_icon(APP_ID) else "audio-x-generic"
+
+
 class LooperApp(Adw.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
@@ -1301,7 +1308,9 @@ class LooperApp(Adw.Application):
         css.load_from_data(CSS)
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-        win = self.props.active_window or LooperWindow(self)
+        Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).add_search_path(ICON_DIR)
+        Gtk.Window.set_default_icon_name(app_icon())
+        win =self.props.active_window or LooperWindow(self)
         win.present()
 
 

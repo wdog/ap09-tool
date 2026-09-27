@@ -1,0 +1,207 @@
+# AP-09 USB protocol and upload notes
+
+How `ap09` talks to the Ammoon AP-09 nano looper, how the protocol was found, and what is
+still open. For installing and using the tool, see the [README](../README.md).
+
+Contents: [Upload status](#upload-status) ·
+[How it was reverse-engineered](#how-it-was-reverse-engineered) · [Transport](#transport) ·
+[SysEx framing](#sysex-framing) · [Packet format](#packet-format-after-unpacking) ·
+[Device / model](#device--model) · [Loop index](#loop-index-nand-block-1980-address-0xf780000) ·
+[Audio layout](#audio-layout) · [Where to continue](#where-to-continue)
+
+## Upload status
+
+**Works over USB, verified bit-exact** (upload a 5 s tone, download it again: identical).
+**Not yet confirmed:** that the pedal plays an uploaded loop after a replug. If it does not,
+the first suspects are record byte 0x07 and the sequence number at 0x0A, which the
+official tool leaves as 0xFF / 0 while the pedal fills them in (see the index section).
+
+### Why the upload works differently from the official tool
+
+The official tool erases blocks and then writes them. On this pedal **the erase command
+(0x21) replies "OK" and does not erase anything**. Tests:
+
+- Erasing a block that holds data, then reading it back (same session, pages never read
+  before, even after the 0x11 handshake) shows the old data is still there.
+- Writing (0x22) works, but only on pages that are already `FF`. On used pages the new
+  data comes out **ANDed** with the old, which is typical NAND behaviour when you program
+  without erasing first.
+
+- Also tried, none of which erases: address as block number, page number, `addr>>9`,
+  `>>10`, `>>12`, `>>16`; blocks above and below 1536; erase immediately followed by a
+  write (to rule out a lazy erase).
+
+**Workaround used by `ap09 upload`** (`upload_loop()`):
+
+1. Walk the blocks in the same order as the official tool (random start, going up,
+   wrapping) and skip blocks referenced by any record in the index.
+2. Still send erase (harmless, and useful if some firmware honours it). Then use the block
+   only if it is **really empty**: device checksum 0x24 over 0x1FFFF bytes == `0xFF01`
+   (all FF) and the first 16 bytes read as FF. Otherwise skip it. Checking one block takes
+   about 0.1 s.
+3. Write the pages (0x22), then verify the whole block with 0x24 against the expected
+   image (data plus FF for the spare bytes and unused pages). On a mismatch, mark the
+   block as used and take another one.
+4. Write the index record into the next **empty** 2-page slot of the index block (checked
+   the same way) and read it back.
+
+**Limits that follow from this:**
+
+- Capacity = number of empty blocks. Measured on this unit: of the first 1024 blocks
+  about 200 had an FF first page. In a test upload, 8 of 14 candidates were already
+  used.
+- **Index compaction by the pedal.** Once, at power-on, with the log filled up to
+  slot 32 of 64, the pedal erased the index block itself and wrote a single record
+  with the current state (`looper\0 ff <valid> ff 00 00`, block list zeroed). So its
+  internal erase works, and compaction frees the slots and wipes the history. A later
+  restart with only 3 records **did not** compact, so the trigger is probably the fill
+  level, not the restart itself (unconfirmed). The old audio blocks stay untouched.
+- The index block cannot be erased over USB. It has 32 record slots (the unit had 15 used, then
+  17). When it is full, upload/select stop with "loop index block is full; record any loop
+  on the pedal once". Assumption (untested): the pedal erases or rotates its own index
+  when it needs to.
+
+### Development history
+
+A first upload (erase + write, like the official tool) produced a corrupted loop, because
+the new data got ANDed with the old. The original loop was still intact (erase does
+nothing), so it was restored by appending a record that points at its old blocks. That is
+what `select` does now. The restore was verified bit-exact against a WAV backup taken
+before the experiment.
+
+---
+
+## How it works
+
+### How it was reverse-engineered
+
+1. `lsusb` shows `0416:5555 Winbond ... "DFU"`, manufacturer "Rowin". The name "DFU" is
+   misleading: it is not a bootloader.
+2. Issue [reinerh/loopertrx#6](https://github.com/reinerh/loopertrx/issues/6) showed that
+   the device talks MIDI SysEx and gave one working message
+   (`F0 00 32 45 00 00 00 40 7F F7`). The upstream `loopertrx` protocol (mass-storage
+   style) does **not** apply to this chip.
+3. The official Windows software, "LooperSuite V1.7" (`Looper+software+1.7.exe`,
+   installer from rowinmusic.com), crashes under Wine. So the installed
+   `Looper Software.exe` (Qt5 + RtMidi, 32-bit) was **disassembled statically with
+   `objdump -d`**. Protocol functions were found from their strings
+   (`CUSBConnect::flash_read failed`, `get_upload_responds::Checksum error!`), from the
+   constant `0xF0`, and by following call chains.
+4. Every hypothesis was tested live on the pedal with small Python scripts.
+
+Addresses below are virtual addresses in `Looper Software.exe` (image base 0x400000,
+file size 620544 bytes, dated 2019-02-20).
+
+### Transport
+
+- USB interface 1 (Audio / MIDIStreaming, string "DFU-Midi"), bulk endpoints `0x02` OUT
+  and `0x81` IN, 64-byte packets. The kernel's `snd-usb-audio` claims it. The tool
+  detaches it and gives it back at the end. (The same messages also work through ALSA:
+  `amidi -p hw:X,0,0 -S "<hex>" -r out.syx`.)
+- Bytes travel in **USB-MIDI event packets**: `[CIN][b0][b1][b2]` on cable 0. CIN 0x4 =
+  SysEx start/continue; 0x5/0x6/0x7 = SysEx end with 1/2/3 bytes.
+- A reply can span many bulk reads, so the tool reads until it sees `F7`.
+
+### SysEx framing
+
+`F0 <packed> F7`, with **no manufacturer ID**. The payload is packed into 7-bit bytes as
+a little-endian bitstream (encoder `0x410a80`, decoder `0x4108a0`). See `pack7` /
+`unpack7` in `ap09.py`. What looks like a Rowin ID (`00 32 45`) is only packed data.
+
+### Packet format (after unpacking)
+
+```
+00 59 | cmd | len (LE24) | body[len] | checksum = ~sum(body) & 0xFF   (0xFF if body empty)
+```
+
+Header `00 59` is the constant at `0x48ea78`. Replies use the same format. Commands that
+answer with a status use reply cmd `0x00` with a 1-byte body: `00` = OK, anything else =
+error (for example `00 59 00 01 00 00 01 FE` is error 1).
+
+| cmd | body | reply | where in the exe | status |
+|---|---|---|---|---|
+| `0x11` info | – | 27 bytes (`"abcdefgh" "abcdefgh" 01 00 05 12..19`), static | `0x4189e0` | ✅ |
+| `0x23` read | `area:u8 addr:LE32 len:LE24` | echo of the 8-byte body, then `len` bytes | `0x418f80` | ✅ |
+| `0x22` write | `area addr:LE32 len:LE24 data` (≤0x1400 per packet) | status | `0x418c60` | ✅ (programs only, needs FF) |
+| `0x21` erase | `area addr:LE32` | status (always OK) | `0x4191b0` / `0x418bc0` | ❌ no effect on this firmware |
+| `0x24` checksum | `area addr:LE32 len:LE32` | reply cmd 0x24: echo of the 9-byte body + `u16` LE sum of the bytes | `0x419220` / `0x418ea0` | ✅ (~0.1 s per 128 KiB) |
+
+Read chunks are capped at 0x3F1 bytes (the official tool's limit), writes at 0x1400.
+Areas: **0** = MCU internal flash (firmware, settings; never write here), **1** = 256 MiB
+NAND. Area 2 returns an error.
+
+The official tool also has an older fallback protocol for other models: raw 4-byte
+commands `59 12 00 34`, `59 13..1e 00 00`, `59 21 00 21` (`0x418b60`, `0x4186a0`). This
+unit does not answer them.
+
+### Device / model
+
+Reading area 0 at `0x2180` (16 bytes) → bytes 4..7 = model id **0x2715 = "NANO LOOPER"**
+(model table at `0x48e700`, entries of 0x54 bytes). The per-model NAND layout table is at
+`0x48ea20` (11 × u32), copied into the song object by `0x408200`:
+
+| field | value | meaning |
+|---|---|---|
+| base | 0 | NAND base offset |
+| index block | 0x7BC (1980) | block that holds the loop index log |
+| max blocks | 0x28A (650) | max blocks per loop, about 10 min |
+| block size | 0x20000 | 128 KiB |
+| page size | 0x800 | 2 KiB |
+| pages/block | 0x40 | 64 |
+| audio/page | 0x7FE | 2046 audio bytes per page; the last 2 bytes are spare (`00 00`) |
+| rate | 0xB71B | 46875 Hz |
+| channels | 1 | mono |
+| bits | 0x18 | 24-bit signed LE |
+| tail unit | 0xBA | 186 bytes (62 samples), length granularity; 11 per page |
+
+### Loop index (NAND block 1980, address `0xF780000`)
+
+This is a log of records. A new record goes every 2 pages (0x1000 bytes). The **newest**
+record is the current loop. When the block is full, the official tool erases it and starts
+again at page 0 (`0x407cfa`). Record (0xA40 bytes, built at `0x407c1e`, read at
+`0x407ff0`):
+
+```
+0x00  "looper\0"
+0x07  u8   written by the pedal (maybe a checksum); the PC tool leaves it 0xFF
+0x08  u8   1 = valid loop, 0 = no loop (cleared)
+0x09  u8   0xFF
+0x0A  u16  sequence number (pedal counts up; PC tool writes 0)
+0x0C  u16  A  \
+0x0E  u8   B   }  units = A*704 + B*11 + C  (units of 186 bytes, minus one)
+0x0F  u8   C  /   length_bytes = (A*64 + B)*2046 + (C+1)*186
+0x10  u16[] NAND block numbers of the loop, in order (ceil(length / 130944) entries)
+0xA38 "looper\0"  (trailer written by the PC tool)
+```
+
+### Audio layout
+
+The loop is the concatenation of 2046-byte chunks. Chunk *k* of a block is stored at
+`block*0x20000 + page*0x800`, where `page = k` in every block **except the first block of
+the loop**. That one is rotated by one page: chunk 0 → page 63, chunk k → page k−1
+(`0x408900` download, `0x408b54` upload). The data is raw 24-bit LE mono PCM at 46875 Hz.
+
+### Upload algorithm of the official tool (for reference)
+
+1. Pick blocks: start at a random block (`rand() % 1980`), go up and wrap around, and skip
+   blocks used by existing songs (`0x406ca0`).
+2. For each block: erase (0x21), then write each 2046-byte chunk into its page (0x22),
+   padding the last chunk to a multiple of 186 bytes. Verify each write with 0x24
+   (`0x418ea0`).
+3. Build the record (0xFF-filled, fields above) and write it into the next free record slot
+   of the index block. If there is no free slot, erase the index block first.
+
+### Where to continue
+
+- **Confirm playback** of an uploaded loop on the pedal. If it fails, try writing record
+  byte 0x07 and the sequence number (0x0A) the way the pedal does. Byte 0x07 is not a
+  simple sum/xor of the record (checked by brute force over all ranges).
+- **Make erase work** (it would lift the empty-block limit). Every packet builder in the
+  exe starts by loading the `00 59` header (`grep -n "0x48ea78"` on the disassembly):
+  `0x407470` read, `0x407d1a` erase (index), `0x408e16` erase (old song type), `0x4189ee`
+  info, `0x418cd8` write, `0x41900f` read, `0x4191b0` erase, `0x419220` checksum. There
+  is no other command, so erase is probably disabled in this firmware version, or allowed
+  only in a device state not reached yet (for example with the pedal stopped or in a
+  special mode).
+- Meaning of the info (0x11) bytes.
+- Command to count the empty blocks (a full scan takes about 4 min at 0.1 s per block).

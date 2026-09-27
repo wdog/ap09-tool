@@ -1,0 +1,3 @@
+# Ammoon AP-09 nano looper (Rowin OEM chip, USB 0416:5555): let ap09 / ap09-gui run without sudo.
+# "uaccess" gives the user logged in at the seat access (systemd-logind); MODE is a fallback for other setups.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0416", ATTRS{idProduct}=="5555", TAG+="uaccess", MODE="0666"

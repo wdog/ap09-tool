@@ -869,7 +869,7 @@ def cmd_play(lp, args):
 
 def cmd_about(lp, args):
     print_kv([
-        ("app", f"ap09 {__version__} · CLI + GUI (ap09_gui.py)", "1"),
+        ("app", f"ap09 {__version__} · CLI + GUI (ap09-gui)", "1"),
         ("author", __author__, None),
         ("license", "MIT · keep the copyright notice in copies and derivatives", None),
         ("device", "Ammoon AP-09 nano looper (Rowin, USB 0416:5555)", None),
@@ -994,20 +994,20 @@ def cmd_dump(lp, args):
 def main():
     fmt = argparse.RawDescriptionHelpFormatter
     ap = argparse.ArgumentParser(
-        prog="ap09.py", formatter_class=fmt,
+        prog="ap09", formatter_class=fmt,
         description=f"Copy loops between an Ammoon AP-09 nano looper (USB 0416:5555) and this computer.\n"
                     f"v{__version__} · by {__author__} · MIT license",
         epilog="""\
 typical use:
-  ap09.py info                     what is on the pedal
-  ap09.py list                     current loop + older loops still in memory
-  ap09.py download loop.wav        save the current loop
-  ap09.py upload song.mp3          put an audio file on the pedal
-  ap09.py select 3                 play old loop #3 again
-  ap09.py clear                    leave the pedal without a loop
+  ap09 info                     what is on the pedal
+  ap09 list                     current loop + older loops still in memory
+  ap09 download loop.wav        save the current loop
+  ap09 upload song.mp3          put an audio file on the pedal
+  ap09 select 3                 play old loop #3 again
+  ap09 clear                    leave the pedal without a loop
 
 After upload / select / clear: unplug and replug the pedal so it reloads.
-Audio on the pedal: mono, 24-bit, 46875 Hz. Run 'ap09.py COMMAND -h' for details.
+Audio on the pedal: mono, 24-bit, 46875 Hz. Run 'ap09 COMMAND -h' for details.
 Without the udev rule (see README) every command needs sudo.""")
     ap.add_argument("-V", "--version", action="version", version=f"ap09 {__version__} · {__author__} · MIT")
     sub = ap.add_subparsers(dest="command", required=True, metavar="COMMAND")
@@ -1038,9 +1038,9 @@ Save a loop as a WAV file: mono, 24-bit PCM, 46875 Hz (the pedal's native
 format, bit-exact). About 12 s for a 20 s loop. Read-only on the pedal.
 
 examples:
-  ap09.py download loop.wav          current loop
-  ap09.py download -r 3 old.wav      loop #3 from 'list'
-  ap09.py download -a myloops/       every loop into myloops/loopNN.wav
+  ap09 download loop.wav          current loop
+  ap09 download -r 3 old.wav      loop #3 from 'list'
+  ap09 download -a myloops/       every loop into myloops/loopNN.wav
 
 convert afterwards if needed:
   ffmpeg -i loop.wav -ar 48000 loop48k.wav
@@ -1145,8 +1145,8 @@ Read raw memory and print it as hex (or save it with -o). Read-only.
 
 areas: 0 = MCU flash (firmware/settings), 1 = 256 MiB NAND (audio + index)
 examples:
-  ap09.py dump 1 0xF780000 0x60      first index record
-  ap09.py dump 0 0x2180 16           model id is bytes 4..7""")
+  ap09 dump 1 0xF780000 0x60      first index record
+  ap09 dump 0 0x2180 16           model id is bytes 4..7""")
     p.add_argument("area", help="0 = MCU flash, 1 = NAND")
     p.add_argument("addr", help="start address (e.g. 0xF780000)")
     p.add_argument("length", help="number of bytes (e.g. 0x60)")
@@ -1160,8 +1160,8 @@ Send one raw command packet and print the reply body (see README, 'Packet
 format'). Only for protocol work: 0x21/0x22 write to the pedal.
 
 examples:
-  ap09.py probe 11                                   device info
-  ap09.py probe 23 010000780f600000                  read 0x60 bytes of NAND at 0xF780000""")
+  ap09 probe 11                                   device info
+  ap09 probe 23 010000780f600000                  read 0x60 bytes of NAND at 0xF780000""")
     p.add_argument("cmd", help="command byte, hex (e.g. 11)")
     p.add_argument("body", nargs="?", help="body bytes, hex")
     p.set_defaults(func=cmd_probe)
@@ -1179,7 +1179,7 @@ examples:
         lp = Looper()
     except usb.core.USBError as e:
         if e.errno == 16:
-            sys.exit("error: pedal busy: another ap09.py (or program) is using it; wait for it to finish")
+            sys.exit("error: pedal busy: another ap09 (or program) is using it; wait for it to finish")
         if e.errno == 13:
             sys.exit("error: permission denied: run with sudo or install the udev rule (see README)")
         sys.exit(f"error: cannot open device: {e}; unplug/replug the pedal and retry")
