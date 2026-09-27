@@ -15,6 +15,84 @@ Versions: tag `v0.1-download` = download only. Branch `upload` = download + uplo
 
 ---
 
+## 0. Graphical app (GTK4)
+
+```
+python3 ap09_gui.py
+```
+
+| Main window | Loops (with deleted shown) |
+|---|---|
+| ![main](docs/gui-main.png) | ![loops](docs/gui-loops.png) |
+| **Upload preview** | **About** |
+| ![upload](docs/gui-upload.png) | ![about](docs/gui-about.png) |
+
+Requirements (Debian/Ubuntu), in addition to `python3-usb` and `ffmpeg` from the CLI
+section:
+
+```
+sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 \
+                 gir1.2-gstreamer-1.0 gstreamer1.0-plugins-good python3-numpy
+```
+
+| package | used for |
+|---|---|
+| `python3-gi`, `gir1.2-gtk-4.0`, `gir1.2-adw-1` | the window (GTK 4 + libadwaita ≥ 1.5 for dialogs) |
+| `gir1.2-gstreamer-1.0`, `gstreamer1.0-plugins-good` | playing loops on the computer |
+| `python3-numpy` | waveforms |
+| `python3-usb` | talking to the pedal |
+| `ffmpeg` | converting mp3/flac/… on upload |
+
+What it does:
+
+- **Detects the pedal automatically** when you plug it in (it checks every 2 s).
+- **On the pedal** card: the current loop with its length, waveform, ▶ play,
+  💾 save as WAV, ✖ clear.
+- **Upload**: drag an audio file onto the window, or click the drop zone / **Upload**
+  (Ctrl+O). A preview with the waveform and length comes first, then a confirmation.
+  Progress shows under the header bar.
+- **Loops in memory**: every older loop with a state badge (in memory / damaged),
+  a small waveform, ▶ play, 💾 save, and **Put on pedal** (`select`).
+- **Player bar** at the bottom: play/pause, click the waveform to seek, stop.
+- **Memory**: free space scan (about 4 min) with a level bar, device info.
+- Menu: scan space, clear, download all loops to a folder, open the cache.
+- Keys: **F5** refresh, **Space** play/pause, **Ctrl+O** upload.
+
+Audio loaded from the pedal is cached in `~/.cache/ap09/`, so it is read over USB only
+once. All pedal access goes through one background thread, and the window never
+freezes. **Don't run the CLI while the app is working on the pedal**: the pedal serves
+one client at a time.
+
+Launcher for the app menu (optional):
+
+```
+sed "s#@DIR@#$PWD#g" ap09-gui.desktop > ~/.local/share/applications/ap09-gui.desktop
+```
+
+### CLI and GUI do the same things
+
+Both are built on the same functions in `ap09.py`. They share loop numbers, state
+names and icons, time format, and the audio cache (`~/.cache/ap09`). A loop read by
+one does not have to be read from the pedal again by the other.
+
+| | CLI (`ap09.py`) | GUI (`ap09_gui.py`) |
+|---|---|---|
+| device + current loop | `info` | "On the pedal" card + Device (expand) |
+| list, stable numbers `#N` | `list` | "Loops" list |
+| show deleted loops | `list --all` | "deleted" switch |
+| listen | `play [-r N]` | ▶ buttons + player bar |
+| save as WAV | `download [-r N] file`, `download -a dir` | 💾 buttons, menu "Download all" |
+| upload | `upload file` | Upload button / drag & drop |
+| make a loop play again | `select N` | "Put on pedal" |
+| delete from the list | `delete N` | 🗑 button |
+| leave the pedal empty | `clear` | ✖ on the card / menu "Clear" |
+| free space | `space` | Memory → Scan |
+| author, license | `about`, `-V` | menu → About |
+
+States: **▶ playing** · **● in memory** · **⚠ damaged N/M** · **✖ deleted**
+
+---
+
 ## 1. How to use it
 
 ### Requirements
@@ -108,9 +186,21 @@ ffmpeg -i song.mp3 -ac 1 -ar 46875 -c:a pcm_s24le song-ap09.wav
 python3 ap09.py clear          # asks for confirmation; -y to skip it
 ```
 
-The pedal ends up with no loop. The audio cannot be wiped over USB. The old loop
-stays in `list` as history (● saved) and `select` can bring it back. The history goes
-away only when the pedal compacts its index (see Upload status).
+The pedal ends up with no loop, and that loop **disappears from `list`**. The clear
+record names the loop it removes, the same way the pedal's own clear records do.
+
+### Delete a loop from the list
+
+```
+python3 ap09.py delete 2       # asks for confirmation; -y to skip it
+python3 ap09.py list --all     # also shows deleted loops (✖)
+python3 ap09.py select 3       # bring a deleted loop back (numbers never change)
+```
+
+The audio cannot be wiped over USB (the erase command is ignored). It stays in memory
+until it gets reused, and `delete` only hides it. Deleting the playing loop is the same
+as `clear`. Deleting an old loop uses 2 index slots, because the playing loop is
+re-selected right after (the pedal only looks at the newest record).
 
 ### What `list` shows
 
@@ -118,15 +208,13 @@ away only when the pedal compacts its index (see Upload status).
 ▶ playing #3  19.91 s
 
  #    length  blocks  state
- 0    13.93s      15  ● saved
+ 0    13.93 s     15  ● in memory
  1     7.94s       9  ⚠ damaged 3/9
- 2    19.91s      22  ↺ duplicate of #3
  3    19.91s      22  ▶ playing
 
 ▶ playing   loop the pedal plays now
-● saved     old loop, not playing, audio still in memory -> select N / download -r N
+● in memory  old loop, not playing, audio still in memory
 ⚠ damaged   old loop, N/M blocks overwritten by a later one
-↺ duplicate same audio as another entry
   history stays until the pedal compacts its index (seen when the log was half full)
 ```
 
@@ -137,9 +225,9 @@ Colours are used on a terminal; set `NO_COLOR=1` to turn them off.
 | icon | state | meaning |
 |---|---|---|
 | ▶ | playing | the loop the pedal plays |
-| ● | saved | older loop, audio still in memory: `download -r N` / `select N` |
+| ● | in memory | older loop, audio still in memory: `download -r N` / `select N` |
 | ⚠ | damaged | older loop, N/M blocks overwritten by a later loop |
-| ↺ | duplicate | same audio as another entry |
+| ✖ | deleted | removed with `clear`/`delete` (only with `list --all`) |
 | ■ | no loop | pedal empty or cleared |
 
 
@@ -168,7 +256,9 @@ sudo python3 ap09.py select 8        # loop #8 becomes the current one again
 ```
 
 Unplug and replug afterwards. `select` does not copy any audio: it only adds an index
-record that points at the old loop's memory blocks. That only works while those blocks
+record that points at the old loop's memory blocks. The index is append-only, so every
+`select` adds a record, but `list` merges records that point at the same audio: each loop
+appears only once. `select` on the loop that is already playing writes nothing. That only works while those blocks
 have not been reused (`list` tells you).
 
 ### Running without sudo
@@ -392,7 +482,26 @@ the loop**. That one is rotated by one page: chunk 0 → page 63, chunk k → pa
 
 ### Files
 
-- `ap09.py` — the tool (transport, protocol, index parsing, download, upload, select).
-- `PROTOCOL.md` — early notes, now **superseded by this README**.
-- `backup-original-loop.wav` — backup of the loop that was on the pedal.
+- `LICENSE` — MIT, © 2026 wdog.
+- `ap09.py` — CLI and core library (transport, protocol, index parsing, download, upload, select, clear, space).
+- `ap09_gui.py` — GTK4/libadwaita app built on `ap09.py`.
+- `ap09-gui.desktop` — launcher template (`@DIR@` = project folder).
+- `ruff.toml` — lint config: `ruff check .` (ruff via `pipx install ruff`).
+
+- `backup-original-loop.wav` (not in git) — local backup of the loop that was on the pedal.
 - `re/` (not in git) — `Looper Software.exe` from the official installer and its `objdump -d` output (`looper_disasm.txt`).
+
+---
+
+## Author and license
+
+**wdog** — <wdog666@gmail.com>
+
+Released under the [MIT License](LICENSE): you may use, copy, modify, improve and
+redistribute this software, provided that **the copyright notice with the author's name
+(`Copyright (c) 2026 wdog <wdog666@gmail.com>`) and the license text are kept** in all
+copies and derivative works.
+
+Not affiliated with Ammoon or Rowin. The protocol was reverse-engineered for
+interoperability; use at your own risk.
+

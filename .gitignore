@@ -1,6 +1,5 @@
 __pycache__/
 *.pyc
 *.wav
-!backup-original-loop.wav
 *.syx
 re/

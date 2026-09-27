@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=AP-09 Looper
+Comment=Download, preview and upload loops on the Ammoon AP-09 nano looper
+Exec=python3 @DIR@/ap09_gui.py
+Icon=audio-x-generic
+Terminal=false
+Categories=AudioVideo;Audio;
