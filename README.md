@@ -18,6 +18,17 @@ The pedal has no Linux software, and the existing open-source tool does not work
 Its USB protocol was reverse-engineered from the vendor's Windows program. Everything here
 was written from scratch.
 
+### Which pedal
+
+<p align="center">
+  <img src="docs/looper.jpg" alt="Ammoon AP-09 nano looper: white mini pedal with LEVEL knob, USB port and footswitch" width="480">
+</p>
+
+The **Ammoon AP-09** nano looper: a small white pedal with one **LEVEL** knob, a footswitch,
+a 9 V jack and a **USB port** on the top. Plugged into a computer it shows up as USB ID
+**`0416:5555`** (`lsusb` calls it "Winbond Electronics Corp. DFU"). Only this model has been
+tested; see [Troubleshooting](#troubleshooting) for similar pedals.
+
 ---
 
 ## Features
