@@ -46,17 +46,19 @@ sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 \
 What it does:
 
 - **Detects the pedal automatically** when you plug it in (it checks every 2 s).
+- **Sidebar** on the left: **Upload** (click or drop a file), free-space scan (about
+  4 min) with a level bar, actions (download all loops to a folder, clear the pedal,
+  open the cache, about) and device info. On a narrow window it folds away; open it
+  with the sidebar button or **F9**.
 - **On the pedal** card: the current loop with its length, waveform, ▶ play,
   💾 save as WAV, ✖ clear.
-- **Upload**: drag an audio file onto the window, or click the drop zone / **Upload**
-  (Ctrl+O). A preview with the waveform and length comes first, then a confirmation.
-  Progress shows under the header bar.
-- **Loops in memory**: every older loop with a state badge (in memory / damaged),
-  a small waveform, ▶ play, 💾 save, and **Put on pedal** (`select`).
+- **Upload**: drag an audio file anywhere onto the window, or click **Upload** in the
+  sidebar (Ctrl+O). A preview with the waveform and length comes first, then a
+  confirmation. Progress shows under the header bar.
+- **Loops**: every older loop with a state badge (in memory / damaged / deleted),
+  a small waveform, ▶ play, 💾 save, ↩ put on pedal (`select`) and 🗑 delete.
 - **Player bar** at the bottom: play/pause, click the waveform to seek, stop.
-- **Memory**: free space scan (about 4 min) with a level bar, device info.
-- Menu: scan space, clear, download all loops to a folder, open the cache.
-- Keys: **F5** refresh, **Space** play/pause, **Ctrl+O** upload.
+- Keys: **F5** refresh, **F9** sidebar, **Space** play/pause, **Ctrl+O** upload.
 
 Audio loaded from the pedal is cached in `~/.cache/ap09/`, so it is read over USB only
 once. All pedal access goes through one background thread, and the window never
